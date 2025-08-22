@@ -3146,8 +3146,8 @@ struct ContentView: View {
         // Start GPS location fetching immediately
         locationManager.requestLocationPermission()
         
-        // Hide splash screen after 1.5 seconds and check if onboarding is needed
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+        // Hide splash screen after 2 seconds and check if onboarding is needed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             withAnimation(.easeInOut(duration: 0.5)) {
                 showSplashScreen = false
                 // Check if user has seen onboarding
@@ -6119,6 +6119,45 @@ struct SplashScreenView: View {
     @State private var logoRotation: Double = 0.0
     @State private var pulseScale: CGFloat = 1.0
     
+    // Driving tips array
+    private let drivingTips = [
+        "Anticipate traffic patterns - most slowdowns happen at the same spots daily",
+        "Keep a 3-second following distance to reduce harsh braking",
+        "Use cruise control on highways to maintain steady speeds",
+        "Plan lane changes early rather than waiting until the last moment",
+        "Coast to red lights instead of accelerating then braking hard",
+        "Check traffic apps before leaving, but take alternate routes sparingly",
+        "Merge at highway speed, not slower - it's safer and smoother",
+        "Use gentle acceleration - jackrabbit starts waste fuel and stress drivetrain",
+        "In stop-and-go traffic, maintain steady slow speeds vs constant stopping",
+        "Pre-cool or pre-heat your car while plugged in to save energy",
+        "Keep tires properly inflated - underinflated tires reduce efficiency",
+        "Remove roof racks when not in use to reduce drag",
+        "Combine errands into one trip rather than multiple short trips",
+        "Park in shade during summer to reduce AC load when starting",
+        "Use eco-mode in city driving, normal mode on highways",
+        "Avoid rush hour peaks by leaving 30 minutes earlier or later",
+        "Learn your engine's power band for efficient highway merging",
+        "Use downhill momentum to maintain speed instead of accelerating",
+        "Keep windows closed above 45mph - AC is more efficient than drag",
+        "Warm up modern cars by driving gently, not idling",
+        "Use GPS predictively - slow down before turns rather than during",
+        "Master the zipper merge - wait until the merge point",
+        "Choose middle lanes on multi-lane roads for fewer lane changes",
+        "Scan 12-15 seconds ahead to anticipate traffic changes",
+        "Use light throttle inputs - heavy acceleration uses more fuel exponentially",
+        "Time parking lot searches during off-peak hours when possible",
+        "Learn traffic signal timing on your regular routes",
+        "Maintain steady speeds uphill rather than surging and coasting",
+        "Use regenerative braking effectively in hybrids and EVs",
+        "Plan fuel stops during off-peak hours to avoid crowded stations"
+    ]
+    
+    private var currentTip: String {
+        let tipIndex = UserDefaults.standard.integer(forKey: "CurrentTipIndex")
+        return drivingTips[tipIndex % drivingTips.count]
+    }
+    
     var body: some View {
         ZStack {
             // Black background
@@ -6163,12 +6202,14 @@ struct SplashScreenView: View {
                         value: logoOpacity
                     )
                 
-                // Loading text
+                // Driving tip
                 if isAnimating {
-                    Text("Setting things up...")
+                    Text(currentTip)
                         .font(.caption)
                         .foregroundColor(.gray)
                         .opacity(0.8)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 40)
                         .animation(
                             .easeInOut(duration: 0.5).delay(0.5),
                             value: isAnimating
@@ -6178,6 +6219,7 @@ struct SplashScreenView: View {
         }
         .onAppear {
             startAnimation()
+            updateTipIndex()
         }
     }
     
@@ -6208,6 +6250,12 @@ struct SplashScreenView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             isAnimating = true
         }
+    }
+    
+    private func updateTipIndex() {
+        let currentIndex = UserDefaults.standard.integer(forKey: "CurrentTipIndex")
+        let nextIndex = (currentIndex + 1) % drivingTips.count
+        UserDefaults.standard.set(nextIndex, forKey: "CurrentTipIndex")
     }
 }
 
