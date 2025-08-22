@@ -162,7 +162,7 @@ The app is built with resilience as a core principle:
 
 ## Contributing
 
-This project was developed with assistance from Claude Code. Contributions are welcome!
+Contributions are welcome!
 
 ### Development Guidelines
 - Follow existing code patterns and architecture
@@ -176,7 +176,6 @@ This project was developed with assistance from Claude Code. Contributions are w
 
 ## Acknowledgments
 
-- Built with [Claude Code](https://claude.ai/code) assistance
 - Uses Apple's SoundAnalysis framework for audio classification
 - Incorporates iOS best practices for location and motion sensing
 
