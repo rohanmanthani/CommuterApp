@@ -3,6 +3,7 @@ import CoreLocation
 import CoreMotion
 import UIKit
 import MapKit
+import Charts
 
 // MARK: - Design System
 struct DesignSystem {
@@ -369,50 +370,42 @@ class SettingsManager: ObservableObject {
         enableMotionSensors = userDefaults.object(forKey: enableMotionSensorsKey) as? Bool ?? true
         enableMicrophone = userDefaults.object(forKey: enableMicrophoneKey) as? Bool ?? true
         
-        print("✅ Loaded settings: Speed=\(speedLimitThreshold), KeepScreen=\(keepScreenOn), LocationOrder=\(useLocationBasedOrdering)")
-        print("✅ Loaded sensor settings: GPS=\(enableGPS), Motion=\(enableMotionSensors), Mic=\(enableMicrophone)")
     }
     
     func saveSpeedLimit(_ limit: Double) {
         speedLimitThreshold = limit
         userDefaults.set(limit, forKey: speedLimitKey)
         userDefaults.synchronize()  // Enable iCloud sync
-        print("💾 Saved speed limit: \(limit) km/h")
     }
     
     func saveKeepScreenOn(_ enabled: Bool) {
         keepScreenOn = enabled
         userDefaults.set(enabled, forKey: keepScreenOnKey)
         userDefaults.synchronize()  // Enable iCloud sync
-        print("💾 Saved keep screen on: \(enabled)")
     }
     
     func saveLocationOrdering(_ useLocationOrdering: Bool) {
         useLocationBasedOrdering = useLocationOrdering
         userDefaults.set(useLocationOrdering, forKey: locationOrderingKey)
         userDefaults.synchronize()  // Enable iCloud sync
-        print("💾 Saved location ordering: \(useLocationOrdering)")
     }
     
     func saveGPSSetting(_ enabled: Bool) {
         enableGPS = enabled
         userDefaults.set(enabled, forKey: enableGPSKey)
         userDefaults.synchronize()
-        print("💾 Saved GPS setting: \(enabled)")
     }
     
     func saveMotionSensorsSetting(_ enabled: Bool) {
         enableMotionSensors = enabled
         userDefaults.set(enabled, forKey: enableMotionSensorsKey)
         userDefaults.synchronize()
-        print("💾 Saved motion sensors setting: \(enabled)")
     }
     
     func saveMicrophoneSetting(_ enabled: Bool) {
         enableMicrophone = enabled
         userDefaults.set(enabled, forKey: enableMicrophoneKey)
         userDefaults.synchronize()
-        print("💾 Saved microphone setting: \(enabled)")
     }
 }
 
@@ -763,19 +756,44 @@ struct CommuteType: Codable, Hashable {
     let id: String
     let displayName: String
     let isDefault: Bool
+    let isOneOff: Bool // For custom one-time trips
     
-    static let homeToOffice = CommuteType(id: "home-to-office", displayName: "Home to Office", isDefault: true)
-    static let officeToHome = CommuteType(id: "office-to-home", displayName: "Office to Home", isDefault: true)
+    static let homeToOffice = CommuteType(id: "home-to-office", displayName: "Home to Office", isDefault: true, isOneOff: false)
+    static let officeToHome = CommuteType(id: "office-to-home", displayName: "Office to Home", isDefault: true, isOneOff: false)
+    
+    // Custom decoder for backward compatibility
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        isDefault = try container.decode(Bool.self, forKey: .isDefault)
+        isOneOff = try container.decodeIfPresent(Bool.self, forKey: .isOneOff) ?? false
+    }
+    
+    // Regular initializer
+    init(id: String, displayName: String, isDefault: Bool, isOneOff: Bool = false) {
+        self.id = id
+        self.displayName = displayName
+        self.isDefault = isDefault
+        self.isOneOff = isOneOff
+    }
 }
 
 struct CommuteFilterOption: Identifiable, Hashable {
     let id: String
     let displayName: String
     
-    static let all = CommuteFilterOption(id: "all", displayName: "All Commutes")
+    static let all = CommuteFilterOption(id: "all", displayName: "All Trips")
+    static let oneOff = CommuteFilterOption(id: "one-off", displayName: "One-Off Trips")
     
     func matches(_ commuteType: CommuteType) -> Bool {
-        return id == "all" || id == commuteType.id
+        if id == "all" {
+            return true
+        } else if id == "one-off" {
+            return commuteType.isOneOff
+        } else {
+            return id == commuteType.id
+        }
     }
 }
 
@@ -848,17 +866,14 @@ class TripManager: ObservableObject {
             // Mark as launched and save defaults as user trips for future use
             userDefaults.set(true, forKey: firstLaunchKey)
             saveTripsAsCustom()
-            print("ℹ️ First launch - initialized with default trips")
         } else {
             // Load saved trips from previous sessions
             if let data = userDefaults.data(forKey: tripsKey),
                let savedTrips = try? JSONDecoder().decode([CommuteType].self, from: data) {
                 availableTrips = savedTrips
-                print("✅ Loaded \(savedTrips.count) saved trips")
             } else {
                 // Fallback if no saved trips found
                 availableTrips = [CommuteType.homeToOffice, CommuteType.officeToHome]
-                print("⚠️ No saved trips found, using defaults")
             }
         }
     }
@@ -868,16 +883,14 @@ class TripManager: ObservableObject {
             let data = try JSONEncoder().encode(availableTrips)
             userDefaults.set(data, forKey: tripsKey)
             userDefaults.synchronize()  // Enable iCloud sync
-            print("✅ Saved \(availableTrips.count) trips")
         } catch {
-            print("❌ Failed to save trips: \(error.localizedDescription)")
         }
     }
     
     private func saveTripsAsCustom() {
         // Convert default trips to custom trips so they can be edited
         availableTrips = availableTrips.map { trip in
-            CommuteType(id: trip.id, displayName: trip.displayName, isDefault: false)
+            CommuteType(id: trip.id, displayName: trip.displayName, isDefault: false, isOneOff: trip.isOneOff)
         }
         saveTrips()
     }
@@ -893,7 +906,7 @@ class TripManager: ObservableObject {
         if let index = availableTrips.firstIndex(where: { $0.id == tripId }) {
             let trip = availableTrips[index]
             // All trips are now treated as custom after first launch
-            availableTrips[index] = CommuteType(id: trip.id, displayName: newName, isDefault: false)
+            availableTrips[index] = CommuteType(id: trip.id, displayName: newName, isDefault: false, isOneOff: trip.isOneOff)
             saveTrips()
         }
     }
@@ -901,6 +914,21 @@ class TripManager: ObservableObject {
     func deleteTrip(tripId: String) {
         availableTrips.removeAll { $0.id == tripId }
         saveTrips()
+    }
+    
+    func createOneOffTrip(name: String) -> CommuteType {
+        let oneOffId = "one-off-\(UUID().uuidString.prefix(8))"
+        return CommuteType(id: oneOffId, displayName: name, isDefault: false, isOneOff: true)
+    }
+    
+    // Get trips for display (excludes one-off trips)
+    var regularTrips: [CommuteType] {
+        return availableTrips.filter { !$0.isOneOff }
+    }
+    
+    // Get all trips including one-off for analytics
+    var allTrips: [CommuteType] {
+        return availableTrips
     }
     
     func isTripNameTaken(_ name: String, excludingTripId: String? = nil) -> Bool {
@@ -915,11 +943,36 @@ class TripManager: ObservableObject {
         return availableTrips.count < 8
     }
     
-    var filterOptions: [CommuteFilterOption] {
+    func filterOptions(withCommutes commutes: [CommuteRecord]) -> [CommuteFilterOption] {
         var options = [CommuteFilterOption.all]
-        options.append(contentsOf: availableTrips.map { trip in
+        
+        // Add regular trips (excludes one-off trips)
+        options.append(contentsOf: regularTrips.map { trip in
             CommuteFilterOption(id: trip.id, displayName: trip.displayName)
         })
+        
+        // Add one-off trips as a single option if any exist in commute history
+        if commutes.contains(where: { $0.type.isOneOff }) {
+            options.append(CommuteFilterOption.oneOff)
+        }
+        
+        return options
+    }
+    
+    // Backward compatibility - this version checks availableTrips only
+    var filterOptions: [CommuteFilterOption] {
+        var options = [CommuteFilterOption.all]
+        
+        // Add regular trips (excludes one-off trips)
+        options.append(contentsOf: regularTrips.map { trip in
+            CommuteFilterOption(id: trip.id, displayName: trip.displayName)
+        })
+        
+        // Add one-off trips as a single option if any exist
+        if availableTrips.contains(where: { $0.isOneOff }) {
+            options.append(CommuteFilterOption.oneOff)
+        }
+        
         return options
     }
 }
@@ -973,19 +1026,15 @@ class SensorManager: ObservableObject {
     
     func startSensorUpdates() {
         guard isMotionAvailable else { 
-            print("⚠️ Motion sensors not available on this device")
-            print("🚀 Trip continues without driving behavior analysis")
             return 
         }
         
         motionManager.startDeviceMotionUpdates(to: .main) { [weak self] motion, error in
             if let error = error {
-                print("⚠️ Motion sensor error: \(error.localizedDescription)")
                 return
             }
             
             guard let motion = motion else {
-                print("⚠️ No motion data received")
                 return
             }
             
@@ -1011,7 +1060,6 @@ class SensorManager: ObservableObject {
         if CMAltimeter.isRelativeAltitudeAvailable() {
             altimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] altitudeData, error in
                 if let error = error {
-                    print("⚠️ Altimeter error: \(error.localizedDescription)")
                     return
                 }
                 
@@ -1019,9 +1067,7 @@ class SensorManager: ObservableObject {
                     self?.currentAltitude = altitude.doubleValue
                 }
             }
-            print("✅ Altimeter started successfully")
         } else {
-            print("⚠️ Altimeter not available on this device")
         }
     }
     
@@ -1329,17 +1375,13 @@ class SoundAnalysisManager: NSObject, ObservableObject {
         if #available(iOS 17.0, *) {
             AVAudioApplication.requestRecordPermission { granted in
                 if granted {
-                    print("🎤 Microphone permission granted")
                 } else {
-                    print("❌ Microphone permission denied")
                 }
             }
         } else {
             AVAudioSession.sharedInstance().requestRecordPermission { granted in
                 if granted {
-                    print("🎤 Microphone permission granted")
                 } else {
-                    print("❌ Microphone permission denied")
                 }
             }
         }
@@ -1372,12 +1414,10 @@ class SoundAnalysisManager: NSObject, ObservableObject {
         DispatchQueue.main.async {
             switch type {
             case .began:
-                print("🔇 Audio session interrupted (phone call, etc.)")
                 self.audioSessionInterrupted = true
                 self.pauseListening()
                 
             case .ended:
-                print("🔊 Audio session interruption ended")
                 self.audioSessionInterrupted = false
                 
                 // Check if we should resume
@@ -1396,13 +1436,11 @@ class SoundAnalysisManager: NSObject, ObservableObject {
     
     @objc private func audioSessionRouteChange(notification: Notification) {
         // Handle route changes gracefully - just log for now
-        print("🎧 Audio route changed - continuing sound analysis")
     }
     
     private func pauseListening() {
         if audioEngine?.isRunning == true {
             audioEngine?.pause()
-            print("⏸️ Sound analysis paused")
         }
     }
     
@@ -1410,9 +1448,7 @@ class SoundAnalysisManager: NSObject, ObservableObject {
         if isListening && audioEngine?.isRunning == false {
             do {
                 try audioEngine?.start()
-                print("▶️ Sound analysis resumed")
             } catch {
-                print("❌ Failed to resume audio engine: \(error)")
             }
         }
     }
@@ -1420,7 +1456,6 @@ class SoundAnalysisManager: NSObject, ObservableObject {
     func startListening() {
         guard let audioEngine = audioEngine,
               let inputNode = inputNode else { 
-            print("❌ Audio engine or input node not available")
             return 
         }
         
@@ -1440,8 +1475,6 @@ class SoundAnalysisManager: NSObject, ObservableObject {
             
             // Validate audio format to prevent crash
             guard inputFormat.channelCount > 0 && inputFormat.sampleRate > 0 else {
-                print("❌ Invalid audio format - Channel count: \(inputFormat.channelCount), Sample rate: \(inputFormat.sampleRate)")
-                print("⚠️ Sound analysis disabled (likely running in simulator)")
                 
                 // Mark as listening but skip actual audio processing
                 DispatchQueue.main.async {
@@ -1450,7 +1483,6 @@ class SoundAnalysisManager: NSObject, ObservableObject {
                 return
             }
             
-            print("✅ Valid audio format - Channels: \(inputFormat.channelCount), Sample rate: \(inputFormat.sampleRate)")
             streamAnalyzer = SNAudioStreamAnalyzer(format: inputFormat)
             
             // Set up sound classification requests
@@ -1463,7 +1495,6 @@ class SoundAnalysisManager: NSObject, ObservableObject {
             
             // Start audio engine with additional validation
             guard !audioEngine.isRunning else {
-                print("⚠️ Audio engine already running")
                 DispatchQueue.main.async {
                     self.isListening = true
                 }
@@ -1476,10 +1507,8 @@ class SoundAnalysisManager: NSObject, ObservableObject {
                 self.isListening = true
             }
             
-            print("🔊 Started sound analysis for horns and sirens")
             
         } catch {
-            print("❌ Failed to start audio engine: \(error)")
             
             // Graceful fallback - mark as listening but without actual audio processing
             DispatchQueue.main.async {
@@ -1492,7 +1521,6 @@ class SoundAnalysisManager: NSObject, ObservableObject {
                     try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
                     isAudioSessionActive = false
                 } catch {
-                    print("❌ Failed to deactivate audio session after error: \(error)")
                 }
             }
         }
@@ -1518,7 +1546,6 @@ class SoundAnalysisManager: NSObject, ObservableObject {
                 try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
                 isAudioSessionActive = false
             } catch {
-                print("❌ Failed to deactivate audio session: \(error)")
             }
         }
         
@@ -1527,7 +1554,6 @@ class SoundAnalysisManager: NSObject, ObservableObject {
             self.audioSessionInterrupted = false
         }
         
-        print("🔇 Stopped sound analysis")
     }
     
     deinit {
@@ -1546,13 +1572,10 @@ class SoundAnalysisManager: NSObject, ObservableObject {
                 
                 try streamAnalyzer?.add(classifyRequest, withObserver: self)
                 
-                print("✅ Sound classification request set up successfully")
             } else {
-                print("⚠️ Sound classification requires iOS 15 or later")
             }
             
         } catch {
-            print("❌ Failed to create sound classification request: \(error)")
         }
     }
 }
@@ -1569,7 +1592,6 @@ extension SoundAnalysisManager: SNResultsObserving {
             
             // Debug logging for all sound classifications above 0.2 confidence
             if confidence > 0.2 {
-                print("🔊 Sound detected: '\(identifier)' with confidence: \(confidence)")
             }
             
             // Look for siren sounds with high sensitivity
@@ -1578,7 +1600,6 @@ extension SoundAnalysisManager: SNResultsObserving {
                 let now = Date()
                 if let lastDetection = self.lastSirenDetectionTime,
                    now.timeIntervalSince(lastDetection) < self.sirenDetectionCooldown {
-                    print("🚨 Siren detected but within cooldown period (ignoring)")
                     return
                 }
                 
@@ -1587,7 +1608,6 @@ extension SoundAnalysisManager: SNResultsObserving {
                     self.lastDetectedSound = "Siren"
                     self.onSirenDetected?()
                 }
-                print("🚨 Siren detected with confidence: \(confidence)")
             }
             // Look for horn sounds with moderate sensitivity
             else if confidence > 0.35 { // Slightly higher threshold to reduce false positives
@@ -1605,7 +1625,6 @@ extension SoundAnalysisManager: SNResultsObserving {
                     let now = Date()
                     if let lastDetection = self.lastHornDetectionTime,
                        now.timeIntervalSince(lastDetection) < self.hornDetectionCooldown {
-                        print("🚗 Horn detected but within cooldown period (ignoring)")
                         return
                     }
                     
@@ -1614,7 +1633,6 @@ extension SoundAnalysisManager: SNResultsObserving {
                         self.lastDetectedSound = "Horn"
                         self.onCarHornDetected?()
                     }
-                    print("🚗 Car horn detected with confidence: \(confidence)")
                 }
                 // Secondary tier for potential horn sounds with lower confidence
                 else if confidence > 0.2 && (
@@ -1632,7 +1650,6 @@ extension SoundAnalysisManager: SNResultsObserving {
                     let now = Date()
                     if let lastDetection = self.lastHornDetectionTime,
                        now.timeIntervalSince(lastDetection) < self.hornDetectionCooldown {
-                        print("🚗 Possible horn detected but within cooldown period (ignoring)")
                         return
                     }
                     
@@ -1641,18 +1658,15 @@ extension SoundAnalysisManager: SNResultsObserving {
                         self.lastDetectedSound = "Possible Horn"
                         self.onCarHornDetected?()
                     }
-                    print("🚗 Possible horn detected with confidence: \(confidence)")
                 }
             }
         }
     }
     
     func request(_ request: SNRequest, didFailWithError error: Error) {
-        print("❌ Sound analysis request failed: \(error)")
     }
     
     func requestDidComplete(_ request: SNRequest) {
-        print("✅ Sound analysis request completed")
     }
 }
 
@@ -1701,7 +1715,6 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     @objc private func appDidBecomeActive() {
         // Restart location updates if we were tracking and app becomes active
         if isTracking {
-            print("📱 App became active - ensuring location updates are running")
             locationManager.startUpdatingLocation()
         }
     }
@@ -1733,33 +1746,26 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         
         // Check permissions and start location updates if available
         guard authorizationStatus == .authorizedWhenInUse || authorizationStatus == .authorizedAlways else {
-            print("⚠️ Location permission not granted - requesting permission")
             requestLocationPermission()
-            print("🚀 Trip tracking active without GPS (manual entry mode)")
             return
         }
         
         // Configure background location if authorized
         if authorizationStatus == .authorizedAlways {
             locationManager.allowsBackgroundLocationUpdates = true
-            print("✅ Background location enabled for uninterrupted tracking")
         } else {
-            print("⚠️ Only 'When In Use' permission - tracking may pause during calls/app switching")
         }
         
         // Check if location services are enabled on background queue to avoid main thread blocking
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard CLLocationManager.locationServicesEnabled() else {
                 DispatchQueue.main.async {
-                    print("⚠️ Location services disabled on device")
-                    print("🚀 Trip tracking active without GPS (manual entry mode)")
                 }
                 return
             }
             
             DispatchQueue.main.async {
                 self?.locationManager.startUpdatingLocation()
-                print("✅ GPS location updates started successfully")
             }
         }
     }
@@ -1899,10 +1905,8 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
             // Enable background location updates if we have "Always" authorization
             if status == .authorizedAlways {
                 locationManager.allowsBackgroundLocationUpdates = true
-                print("✅ Background location updates enabled for continuous tracking")
             } else {
                 locationManager.allowsBackgroundLocationUpdates = false
-                print("⚠️ Background location updates disabled - may lose GPS during calls/app switching")
             }
         default:
             break
@@ -1970,7 +1974,7 @@ class CommuteTracker: ObservableObject {
         startMetricsCollection()
     }
     
-    func stopCommute() {
+    func stopCommute(onCompletion: ((UUID) -> Void)? = nil) {
         guard let active = activeCommute else { return }
         let endTime = Date()
         let duration = endTime.timeIntervalSince(active.startTime)
@@ -2035,19 +2039,16 @@ class CommuteTracker: ObservableObject {
             
             // Save after UI state is updated
             self.saveCommutes()
+            
+            // Notify completion with the commute ID
+            onCompletion?(commute.id)
         }
         
-        print("🔄 Commute creation completed")
-        print("🔄 Current driving events: \(currentDrivingEvents.count)")
-        print("🔄 Commute ID: \(commute.id)")
         
         // Test encoding the commute before adding to array
         do {
             let testData = try JSONEncoder().encode([commute])
-            print("✅ Successfully encoded test commute (\(testData.count) bytes)")
         } catch {
-            print("❌ Failed to encode new commute: \(error)")
-            print("❌ Error details: \(error)")
             return // Don't save if we can't encode
         }
     }
@@ -2077,7 +2078,6 @@ class CommuteTracker: ObservableObject {
             break
         }
         
-        print("📍 Added \(event.type.displayName) event at (\(event.location.latitude), \(event.location.longitude))")
     }
     
     private func collectSensorMetrics() {
@@ -2250,7 +2250,6 @@ class CommuteTracker: ObservableObject {
         // Use shared formatters from CommuteRecord
         for commute in commutes.reversed() {
             let date = commute.formattedDate
-            print("🗓️ Commute startTime: \(commute.startTime), formatted: \(date)")
             let type = commute.type.displayName
             let startTime = commute.formattedStartTime
             let endTime = CommuteRecord.timeFormatter.string(from: commute.endTime)
@@ -2274,11 +2273,8 @@ class CommuteTracker: ObservableObject {
     }
     
     func importFromCSV(_ csvContent: String) throws -> Int {
-        print("📊 Starting CSV import...")
-        print("📊 CSV content length: \(csvContent.count) characters")
         
         let lines = csvContent.components(separatedBy: .newlines).filter { !$0.isEmpty }
-        print("📊 Found \(lines.count) non-empty lines")
         
         guard lines.count > 1 else {
             throw ImportError.invalidFormat("CSV file is empty or contains only header")
@@ -2287,14 +2283,11 @@ class CommuteTracker: ObservableObject {
         let header = lines[0]
         let dataLines = Array(lines[1...])
         
-        print("📊 Header: \(header)")
-        print("📊 Data lines: \(dataLines.count)")
         
         // Detect format based on header
         let isOldFormat = header.contains("Car Horn Events")
         let expectedColumns = isOldFormat ? 27 : 27 // Same number of columns, just different names
         
-        print("📊 Detected format: \(isOldFormat ? "Old" : "New")")
         
         var importedCount = 0
         var skippedCount = 0
@@ -2308,29 +2301,24 @@ class CommuteTracker: ObservableObject {
         
         for (index, line) in dataLines.enumerated() {
             do {
-                print("📊 Processing line \(index + 2): \(line.prefix(100))...")
                 let columns = parseCSVLine(line)
-                print("📊 Parsed \(columns.count) columns: \(columns.prefix(5))")
                 
                 guard columns.count >= expectedColumns else {
-                    print("⚠️ Skipping line \(index + 2): insufficient columns (\(columns.count)/\(expectedColumns))")
                     skippedCount += 1
                     continue
                 }
                 
                 // Parse date and times
-                print("📊 Parsing date: '\(columns[0])' startTime: '\(columns[2])' endTime: '\(columns[3])'")
                 guard let date = dateFormatter.date(from: columns[0]),
                       let startTime = parseTimeWithDate(columns[2], date: date),
                       let endTime = parseTimeWithDate(columns[3], date: date) else {
-                    print("⚠️ Skipping line \(index + 2): invalid date/time format")
                     skippedCount += 1
                     continue
                 }
                 
                 // Parse commute type
                 let typeString = columns[1]
-                let commuteType = CommuteType(id: typeString.lowercased().replacingOccurrences(of: " ", with: "-"), displayName: typeString, isDefault: false)
+                let commuteType = CommuteType(id: typeString.lowercased().replacingOccurrences(of: " ", with: "-"), displayName: typeString, isDefault: false, isOneOff: false)
                 
                 // Parse metrics with backward compatibility
                 let metrics = try parseMetricsFromCSV(columns: columns, isOldFormat: isOldFormat)
@@ -2354,20 +2342,16 @@ class CommuteTracker: ObservableObject {
                 if !isDuplicateCommute(commute) {
                     commutes.append(commute)
                     importedCount += 1
-                    print("✅ Successfully imported record \(importedCount)")
                 } else {
-                    print("⚠️ Skipping duplicate commute")
                     skippedCount += 1
                 }
                 
             } catch {
-                print("❌ Error parsing line \(index + 2): \(error)")
                 errorCount += 1
                 continue
             }
         }
         
-        print("📊 Import summary: \(importedCount) imported, \(skippedCount) skipped, \(errorCount) errors")
         
         // Sort by start time
         commutes.sort { $0.startTime < $1.startTime }
@@ -2414,7 +2398,6 @@ class CommuteTracker: ObservableObject {
         fields.append(currentField.trimmingCharacters(in: .whitespacesAndNewlines))
         
         // Debug: print first few fields to see parsing
-        print("🔍 Parsed fields: \(fields.prefix(6).map { "\"\($0)\"" })")
         
         return fields
     }
@@ -2558,18 +2541,12 @@ class CommuteTracker: ObservableObject {
     
     // MARK: - Persistence Methods
     private func saveCommutes() {
-        print("🔄 Starting to save \(commutes.count) commutes...")
         
         // Test each commute individually to find the problematic one
         for (index, commute) in commutes.enumerated() {
             do {
                 let testData = try JSONEncoder().encode(commute)
-                print("✅ Commute \(index) encoded successfully (\(testData.count) bytes)")
             } catch {
-                print("❌ Commute \(index) failed to encode: \(error)")
-                print("❌ Problematic commute ID: \(commute.id)")
-                print("❌ Commute type: \(commute.type.displayName)")
-                print("❌ Driving events count: \(commute.drivingEvents.count)")
                 return // Don't proceed if any commute can't be encoded
             }
         }
@@ -2579,12 +2556,9 @@ class CommuteTracker: ObservableObject {
             encoder.dateEncodingStrategy = .secondsSince1970
             
             let data = try encoder.encode(commutes)
-            print("✅ Successfully encoded all commutes data (\(data.count) bytes)")
             
             userDefaults.set(data, forKey: commutesKey)
-            print("✅ Saved commutes to UserDefaults")
             
-            print("✅ Saved \(commutes.count) commutes to persistent storage")
             
             // Update sync data size
             syncDataSize = formatBytes(data.count)
@@ -2592,12 +2566,8 @@ class CommuteTracker: ObservableObject {
             // Perform iCloud sync
             userDefaults.synchronize()
             lastSyncTime = Date()
-            print("📱 iCloud sync completed")
-            print("✅ Updated sync status - Size: \(syncDataSize)")
             
         } catch {
-            print("❌ Failed to save commutes array: \(error.localizedDescription)")
-            print("❌ Error details: \(error)")
             
             // Reset sync properties on error
             syncDataSize = "0 KB"
@@ -2627,7 +2597,6 @@ class CommuteTracker: ObservableObject {
         
         guard let data = userDefaults.data(forKey: commutesKey),
               !data.isEmpty else {
-            print("ℹ️ No saved commutes found")
             // Initialize empty sync data size
             syncDataSize = "0 KB"
             commutes = []
@@ -2635,7 +2604,9 @@ class CommuteTracker: ObservableObject {
         }
         
         do {
-            commutes = try JSONDecoder().decode([CommuteRecord].self, from: data)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .secondsSince1970
+            commutes = try decoder.decode([CommuteRecord].self, from: data)
             
             // Update sync data size safely
             syncDataSize = formatBytes(data.count)
@@ -2645,33 +2616,16 @@ class CommuteTracker: ObservableObject {
                 lastSyncTime = Date()
             }
             
-            print("✅ Loaded \(commutes.count) commutes from persistent storage")
-            print("✅ Sync status - Size: \(syncDataSize), Last sync: \(lastSyncTime?.description ?? "Never")")
             
         } catch let DecodingError.keyNotFound(key, context) {
-            print("❌ Failed to load commutes - Missing key: \(key.stringValue)")
-            print("❌ Context: \(context.debugDescription)")
-            print("🗑️ Clearing corrupted data and starting fresh")
             clearCorruptedData()
         } catch let DecodingError.typeMismatch(type, context) {
-            print("❌ Failed to load commutes - Type mismatch for \(type)")
-            print("❌ Context: \(context.debugDescription)")
-            print("🗑️ Clearing corrupted data and starting fresh")
             clearCorruptedData()
         } catch let DecodingError.valueNotFound(type, context) {
-            print("❌ Failed to load commutes - Value not found for \(type)")
-            print("❌ Context: \(context.debugDescription)")
-            print("🗑️ Clearing corrupted data and starting fresh")
             clearCorruptedData()
         } catch let DecodingError.dataCorrupted(context) {
-            print("❌ Failed to load commutes - Data corrupted")
-            print("❌ Context: \(context.debugDescription)")
-            print("🗑️ Clearing corrupted data and starting fresh")
             clearCorruptedData()
         } catch {
-            print("❌ Failed to load commutes: \(error.localizedDescription)")
-            print("❌ Error type: \(type(of: error))")
-            print("🗑️ Clearing corrupted data and starting fresh")
             clearCorruptedData()
         }
     }
@@ -2686,12 +2640,9 @@ class CommuteTracker: ObservableObject {
         syncDataSize = "0 KB"
         lastSyncTime = nil
         
-        print("🧹 Cleared corrupted data from storage")
-        print("✅ App reset to clean state - ready for new trips")
     }
     
     func clearAllData() {
-        print("🗑️ DEBUG: Clearing all app data...")
         
         // Clear all UserDefaults data
         userDefaults.removeObject(forKey: commutesKey)
@@ -2707,8 +2658,6 @@ class CommuteTracker: ObservableObject {
         // Sync the cleared state to iCloud
         userDefaults.synchronize()
         
-        print("✅ DEBUG: All data cleared - app reset to clean state")
-        print("📱 DEBUG: iCloud sync completed for cleared state")
     }
     
     // MARK: - Backup and Restore Methods
@@ -2732,19 +2681,14 @@ class CommuteTracker: ObservableObject {
             let compressedData = try (jsonData as NSData).compressed(using: .lzfse)
             let compressionRatio = Double(compressedData.count) / Double(jsonData.count)
             
-            print("✅ Exported all app data - Original: \(jsonData.count) bytes, Compressed: \(compressedData.count) bytes")
-            print("📦 Compression ratio: \(String(format: "%.1f%%", compressionRatio * 100))")
             
             return compressedData as Data
         } catch {
-            print("❌ Failed to export data: \(error.localizedDescription)")
             return nil
         }
     }
     
     func importData(_ data: Data, tripManager: TripManager? = nil) -> Bool {
-        print("🔄 Starting import process...")
-        print("📋 Supporting both modern and legacy AppDataExport formats")
         
         // Accept both modern and legacy AppDataExport formats with backward compatibility
         return tryModernFormat(data, tripManager: tripManager)
@@ -2752,17 +2696,14 @@ class CommuteTracker: ObservableObject {
     
     private func tryModernFormat(_ data: Data, tripManager: TripManager? = nil) -> Bool {
         do {
-            print("🔄 Decoding AppDataExport format...")
             
             // Try to decompress the data first (for compressed exports)
             var jsonData: Data = data
             do {
                 let decompressedData = try (data as NSData).decompressed(using: .lzfse)
                 jsonData = decompressedData as Data
-                print("📦 Successfully decompressed data from \(data.count) to \(jsonData.count) bytes")
             } catch {
                 // If decompression fails, assume it's uncompressed data
-                print("📋 Data appears to be uncompressed, proceeding with original data")
                 jsonData = data
             }
             
@@ -2774,17 +2715,14 @@ class CommuteTracker: ObservableObject {
                 
                 // Try to decode as double (seconds since 1970)
                 if let timestamp = try? container.decode(Double.self) {
-                    print("📅 Decoding timestamp: \(timestamp)")
                     // Check if this looks like milliseconds instead of seconds
                     if timestamp > 1_000_000_000_000 {
                         // This looks like milliseconds, convert to seconds
                         let date = Date(timeIntervalSince1970: timestamp / 1000.0)
-                        print("📅 Decoded as milliseconds -> \(date)")
                         return date
                     } else {
                         // This looks like seconds
                         let date = Date(timeIntervalSince1970: timestamp)
-                        print("📅 Decoded as seconds -> \(date)")
                         return date
                     }
                 }
@@ -2822,7 +2760,6 @@ class CommuteTracker: ObservableObject {
             }
             
             let importData = try decoder.decode(AppDataExport.self, from: jsonData)
-            print("✅ Successfully decoded AppDataExport with \(importData.commutes.count) commutes")
             
             commutes.append(contentsOf: importData.commutes)
             saveCommutes()
@@ -2833,18 +2770,13 @@ class CommuteTracker: ObservableObject {
                     // Check if this custom trip doesn't already exist
                     if !tripManager.availableTrips.contains(where: { $0.id == customTrip.id }) {
                         tripManager.availableTrips.append(customTrip)
-                        print("➕ Added custom trip type: \(customTrip.displayName)")
                     }
                 }
                 tripManager.saveTrips()
-                print("✅ Imported \(importData.customTrips.count) custom trip types")
             }
             
-            print("✅ Imported \(importData.commutes.count) commutes")
             return true
         } catch {
-            print("❌ Import failed: \(error.localizedDescription)")
-            print("❌ Could not decode as AppDataExport format - please check file integrity")
             return false
         }
     }
@@ -2967,6 +2899,8 @@ struct ContentView: View {
     @State private var isTracking = false
     @State private var trackingDuration: TimeInterval = 0
     @State private var timer: Timer?
+    @State private var completedTripId: UUID?
+    @State private var showingTripCompletion = false
     @State private var showDeleteAllAlert = false
     @State private var selectedCommuteFilter: CommuteFilterOption = .all
     @State private var showTripEditor = false
@@ -2981,6 +2915,10 @@ struct ContentView: View {
     @State private var fullScreenMapCommute: CommuteRecord?
     @State private var showDrivingEvents = true
     @State private var visibleEventTypes: Set<DrivingEvent.EventType> = Set(DrivingEvent.EventType.allCases)
+    @State private var showOneOffTripSheet = false
+    @State private var oneOffTripName = ""
+    @State private var showDriveQualityExplanation = false
+    @State private var showDepartureTimeExplanation = false
     
     var body: some View {
         if showSplashScreen {
@@ -3076,20 +3014,15 @@ struct ContentView: View {
                 }
                 
                 do {
-                    print("📁 Attempting to import from: \(url.path)")
-                    print("🔐 Security-scoped access: \(hasAccess)")
                     
                     let data = try Data(contentsOf: url)
-                    print("📊 File size: \(data.count) bytes")
                     
                     handleImportedData(data)
                 } catch {
-                    print("❌ Import error: \(error.localizedDescription)")
                     importResult = .failure("Failed to read backup file: \(error.localizedDescription)")
                 }
                 
             case .failure(let error):
-                print("❌ File selection error: \(error.localizedDescription)")
                 importResult = .failure("Failed to select file: \(error.localizedDescription)")
             }
         }
@@ -3111,10 +3044,6 @@ struct ContentView: View {
                 }
                 
                 do {
-                    print("📁 Attempting to import CSV from: \(url.path)")
-                    print("🔐 Security-scoped access: \(hasAccess)")
-                    print("📂 File exists: \(FileManager.default.fileExists(atPath: url.path))")
-                    print("📂 File readable: \(FileManager.default.isReadableFile(atPath: url.path))")
                     
                     // Try different encodings if UTF-8 fails
                     var csvContent: String
@@ -3122,12 +3051,10 @@ struct ContentView: View {
                         csvContent = utf8Content
                     } else if let asciiContent = try? String(contentsOf: url, encoding: .ascii) {
                         csvContent = asciiContent
-                        print("⚠️ Using ASCII encoding instead of UTF-8")
                     } else {
                         throw NSError(domain: "CSVImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not read file with UTF-8 or ASCII encoding"])
                     }
                     
-                    print("📊 CSV content length: \(csvContent.count) characters")
                     
                     let importedCount = try commuteTracker.importFromCSV(csvContent)
                     
@@ -3136,14 +3063,12 @@ struct ContentView: View {
                     }
                     
                 } catch {
-                    print("❌ CSV import error: \(error.localizedDescription)")
                     DispatchQueue.main.async {
                         csvImportResult = .failure("Failed to import CSV: \(error.localizedDescription)")
                     }
                 }
                 
             case .failure(let error):
-                print("❌ CSV file selection error: \(error.localizedDescription)")
                 csvImportResult = .failure("Failed to select CSV file: \(error.localizedDescription)")
             }
         }
@@ -3180,6 +3105,39 @@ struct ContentView: View {
         }) { commute in
             FullScreenMapView(commute: commute)
         }
+        .sheet(isPresented: $showDriveQualityExplanation) {
+            DriveQualityExplanationView()
+        }
+        .sheet(isPresented: $showDepartureTimeExplanation) {
+            DepartureTimeExplanationView()
+        }
+        .overlay(
+            Group {
+                if showingTripCompletion {
+                    ZStack {
+                        Color.black.opacity(0.3)
+                            .ignoresSafeArea()
+                        
+                        VStack(spacing: 16) {
+                            ProgressView()
+                                .scaleEffect(1.2)
+                                .progressViewStyle(CircularProgressViewStyle(tint: DesignSystem.Colors.primary))
+                            
+                            Text("Saving Trip...")
+                                .font(DesignSystem.Typography.headline)
+                                .foregroundColor(DesignSystem.Colors.text)
+                        }
+                        .padding(24)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16)
+                                .fill(.ultraThinMaterial)
+                        )
+                    }
+                    .transition(.opacity)
+                    .animation(.easeInOut(duration: 0.3), value: showingTripCompletion)
+                }
+            }
+        )
         }
     }
     
@@ -3232,51 +3190,102 @@ struct ContentView: View {
                             .cornerRadius(12)
                         }
                     } else {
-                        VStack(spacing: 15) {
-                            // Smart ordering indicator
-                            if settingsManager.useLocationBasedOrdering && 
-                               !commuteTracker.commutes.isEmpty && 
-                               locationManager.currentLocation != nil {
-                                Label {
-                                    Text("Trips ordered by location relevance")
-                                        .font(DesignSystem.Typography.caption)
-                                        .foregroundColor(DesignSystem.Colors.secondaryText)
-                                } icon: {
-                                    Image(systemName: "location.fill")
-                                        .font(.caption)
-                                        .foregroundColor(DesignSystem.Colors.primary)
+                        VStack(spacing: 20) {
+                            // One-Off Trip Section
+                            VStack(spacing: 12) {
+                                Button(action: {
+                                    showOneOffTripSheet = true
+                                }) {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text("One-Off Trip")
+                                                .font(.headline)
+                                                .foregroundColor(.white)
+                                                .fontWeight(.medium)
+                                            
+                                            Text("Create a one-time trip")
+                                                .font(.caption)
+                                                .foregroundColor(.white.opacity(0.8))
+                                        }
+                                        
+                                        Spacer()
+                                        
+                                        Image(systemName: "plus.circle.fill")
+                                            .font(.title2)
+                                            .foregroundColor(.white.opacity(0.9))
+                                    }
+                                    .padding(16)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.orange.opacity(0.8))
+                                    .cornerRadius(12)
+                                    .contentShape(Rectangle())
                                 }
-                                .padding(.bottom, DesignSystem.Spacing.sm)
                             }
                             
-                            VStack(spacing: DesignSystem.Spacing.md) {
-                                ForEach(Array(getSmartOrderedTrips().enumerated()), id: \.element.id) { index, trip in
-                                    Button(action: {
-                                        startTracking(trip)
-                                    }) {
-                                        HStack {
-                                            VStack(alignment: .leading, spacing: 4) {
-                                                Text(trip.displayName)
-                                                    .font(.headline)
-                                                    .foregroundColor(.white)
-                                                    .fontWeight(.medium)
+                            // My Commutes Section
+                            VStack(spacing: 15) {
+                                HStack {
+                                    Text("My Commutes")
+                                        .font(.title2)
+                                        .fontWeight(.bold)
+                                        .foregroundColor(DesignSystem.Colors.text)
+                                    
+                                    Spacer()
+                                    
+                                    Button("Edit") {
+                                        showTripEditor = true
+                                    }
+                                    .font(.subheadline)
+                                    .foregroundColor(DesignSystem.Colors.primary)
+                                }
+                                .padding(.horizontal, 4)
+                                
+                                // Smart ordering indicator
+                                if settingsManager.useLocationBasedOrdering && 
+                                   !commuteTracker.commutes.isEmpty && 
+                                   locationManager.currentLocation != nil {
+                                    Label {
+                                        Text("Ordered by location relevance")
+                                            .font(DesignSystem.Typography.caption)
+                                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                                    } icon: {
+                                        Image(systemName: "location.fill")
+                                            .font(.caption)
+                                            .foregroundColor(DesignSystem.Colors.primary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 4)
+                                }
+                                
+                                VStack(spacing: DesignSystem.Spacing.md) {
+                                    ForEach(Array(getSmartOrderedTrips().enumerated()), id: \.element.id) { index, trip in
+                                        Button(action: {
+                                            startTracking(trip)
+                                        }) {
+                                            HStack {
+                                                VStack(alignment: .leading, spacing: 4) {
+                                                    Text(trip.displayName)
+                                                        .font(.headline)
+                                                        .foregroundColor(.white)
+                                                        .fontWeight(.medium)
+                                                    
+                                                    Text("Tap to start tracking")
+                                                        .font(.caption)
+                                                        .foregroundColor(.white.opacity(0.8))
+                                                }
                                                 
-                                                Text("Tap to start tracking")
-                                                    .font(.caption)
-                                                    .foregroundColor(.white.opacity(0.8))
+                                                Spacer()
+                                                
+                                                Image(systemName: "play.circle.fill")
+                                                    .font(.title2)
+                                                    .foregroundColor(.white.opacity(0.9))
                                             }
-                                            
-                                            Spacer()
-                                            
-                                            Image(systemName: "play.circle.fill")
-                                                .font(.title2)
-                                                .foregroundColor(.white.opacity(0.9))
+                                            .padding(16)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .background(tripButtonColor(for: index))
+                                            .cornerRadius(12)
+                                            .contentShape(Rectangle())
                                         }
-                                        .padding(16)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(tripButtonColor(for: index))
-                                        .cornerRadius(12)
-                                        .contentShape(Rectangle())
                                     }
                                 }
                             }
@@ -3288,19 +3297,95 @@ struct ContentView: View {
             .background(DesignSystem.Colors.background)
             .navigationTitle("Track")
             .navigationBarTitleDisplayMode(.large)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    if !isTracking {
-                        Button("Edit") {
-                            showTripEditor = true
-                        }
-                    }
-                }
-            }
             .sheet(isPresented: $showTripEditor) {
                 TripEditorView()
                     .environmentObject(tripManager)
                     .environmentObject(commuteTracker)
+            }
+            .sheet(isPresented: $showOneOffTripSheet) {
+                OneOffTripSheet(
+                    tripName: $oneOffTripName,
+                    onStart: { name in
+                        let oneOffTrip = tripManager.createOneOffTrip(name: name)
+                        startTracking(oneOffTrip)
+                        showOneOffTripSheet = false
+                        oneOffTripName = ""
+                    },
+                    onCancel: {
+                        showOneOffTripSheet = false
+                        oneOffTripName = ""
+                    }
+                )
+            }
+        }
+    }
+    
+    // MARK: - One-Off Trip Sheet
+    struct OneOffTripSheet: View {
+        @Binding var tripName: String
+        let onStart: (String) -> Void
+        let onCancel: () -> Void
+        
+        var body: some View {
+            NavigationView {
+                VStack(spacing: 24) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Create Custom Trip")
+                            .font(.title2)
+                            .fontWeight(.bold)
+                        
+                        Text("Enter a name for your one-time trip. This won't be saved to your regular trips list.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Trip Name")
+                            .font(.headline)
+                        
+                        TextField("e.g., Airport Trip, Friend's House", text: $tripName)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            .submitLabel(.done)
+                            .onSubmit {
+                                if !tripName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    onStart(tripName.trimmingCharacters(in: .whitespacesAndNewlines))
+                                }
+                            }
+                    }
+                    
+                    Spacer()
+                    
+                    VStack(spacing: 12) {
+                        Button(action: {
+                            let trimmedName = tripName.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmedName.isEmpty {
+                                onStart(trimmedName)
+                            }
+                        }) {
+                            HStack {
+                                Image(systemName: "play.circle.fill")
+                                Text("Start Trip")
+                            }
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(tripName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.gray : Color.green)
+                            .cornerRadius(12)
+                        }
+                        .disabled(tripName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        
+                        Button("Cancel") {
+                            onCancel()
+                        }
+                        .foregroundColor(.secondary)
+                    }
+                }
+                .padding()
+                .navigationTitle("Custom Trip")
+                .navigationBarTitleDisplayMode(.inline)
+                .navigationBarBackButtonHidden(true)
             }
         }
     }
@@ -3613,11 +3698,9 @@ struct ContentView: View {
     }
     
     private func startTracking(_ type: CommuteType) {
-        print("🚀 Starting trip: \(type.displayName)")
         
         // Safety checks before starting
         guard !isTracking else {
-            print("⚠️ Already tracking a trip")
             return
         }
         
@@ -3627,7 +3710,6 @@ struct ContentView: View {
         
         // Start commute tracking (core functionality)
         commuteTracker.startCommute(type: type, sensorManager: sensorManager, locationManager: locationManager, settingsManager: settingsManager)
-        print("✅ CommuteTracker started successfully")
         
         // Start duration timer (essential for trip tracking)
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
@@ -3635,52 +3717,39 @@ struct ContentView: View {
                 trackingDuration = Date().timeIntervalSince(startTime)
             }
         }
-        print("✅ Duration timer started")
         
         // OPTIONAL SENSOR FUNCTIONALITY - Handle failures gracefully
         
         // Start location updates only if GPS is enabled
         if settingsManager.enableGPS {
             locationManager.startLocationUpdates()
-            print("✅ Location updates started")
         } else {
-            print("⚠️ GPS tracking disabled by user - location data will not be recorded")
         }
         
         // Start motion sensors only if enabled
         if settingsManager.enableMotionSensors {
             sensorManager.startSensorUpdates()
             if sensorManager.isMotionAvailable {
-                print("✅ Sensor updates started")
             } else {
-                print("⚠️ Motion sensors unavailable")
-                print("🚀 Trip continues without motion detection")
             }
         } else {
-            print("⚠️ Motion sensors disabled by user - driving behavior analysis will not be recorded")
         }
         
         // Start sound analysis only if microphone is enabled
         if settingsManager.enableMicrophone {
             soundAnalysisManager.startListening()
             setupSoundEventCallbacks()
-            print("✅ Sound analysis started")
         } else {
-            print("⚠️ Microphone disabled by user - horn and siren detection will not be recorded")
         }
         
         // Keep screen on during active trip
         if settingsManager.keepScreenOn {
             UIApplication.shared.isIdleTimerDisabled = true
-            print("✅ Screen sleep disabled")
         }
         
-        print("✅ Trip started successfully - Core functionality active")
         if locationManager.authorizationStatus != .authorizedWhenInUse && locationManager.authorizationStatus != .authorizedAlways {
-            print("⚠️ Location permission not granted - GPS tracking disabled")
         }
         if !sensorManager.isMotionAvailable {
-            print("⚠️ Motion sensors not available - Driving metrics disabled")
         }
     }
     
@@ -3697,7 +3766,6 @@ struct ContentView: View {
             )
             
             commuteTracker.addDrivingEvent(event)
-            print("🚗 Car horn event recorded at \(location.coordinate)")
         }
         
         soundAnalysisManager.onSirenDetected = {
@@ -3712,7 +3780,6 @@ struct ContentView: View {
             )
             
             commuteTracker.addDrivingEvent(event)
-            print("🚨 Siren event recorded at \(location.coordinate)")
         }
     }
     
@@ -3726,10 +3793,20 @@ struct ContentView: View {
         UIApplication.shared.isIdleTimerDisabled = false
         
         
-        commuteTracker.stopCommute()
+        commuteTracker.stopCommute { [self] completedTripId in
+            // Store the completed trip ID and navigate to history
+            self.completedTripId = completedTripId
+            self.showingTripCompletion = true
+            
+            // Add a small delay for loading state, then navigate
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.selectedTab = 1 // Navigate to History tab
+                self.expandedCommuteIds = [completedTripId] // Expand the completed trip
+                self.showingTripCompletion = false
+            }
+        }
         sensorManager.stopSensorUpdates()
         soundAnalysisManager.stopListening()
-        print("✅ Sound analysis stopped")
     }
     
     private func formatDuration(_ duration: TimeInterval) -> String {
@@ -3758,29 +3835,30 @@ struct ContentView: View {
                 window.rootViewController?.present(activityVC, animated: true)
             }
         } catch {
-            print("❌ Failed to share backup file: \(error.localizedDescription)")
         }
     }
     
     private func handleImportedData(_ data: Data) {
-        print("🔄 Processing import data...")
-        print("📊 Data size: \(data.count) bytes")
         
         // Try to peek at the data structure
         if let jsonObject = try? JSONSerialization.jsonObject(with: data),
            let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject, options: .prettyPrinted),
            let jsonString = String(data: jsonData, encoding: .utf8) {
             let preview = String(jsonString.prefix(200))
-            print("📋 JSON preview: \(preview)...")
         }
         
         if commuteTracker.importData(data, tripManager: tripManager) {
-            print("✅ Import successful!")
             importResult = .success("Successfully imported \(commuteTracker.commutes.count) trips and settings")
         } else {
-            print("❌ Import failed - format issue")
             importResult = .failure("Failed to import backup file. Please check the file format.")
         }
+    }
+    
+    // Helper function to build commute row ID
+    private func buildCommuteRowId(for commute: CommuteRecord) -> String {
+        let tripCount = tripManager.availableTrips.count
+        let tripNames = tripManager.availableTrips.map { $0.displayName }.joined()
+        return "\(commute.id.uuidString)-\(tripCount)-\(tripNames)"
     }
     
     // MARK: - History View
@@ -3796,8 +3874,9 @@ struct ContentView: View {
                 } else {
                     List {
                         ForEach(commuteTracker.commutes, id: \.id) { commute in
+                            let rowId = buildCommuteRowId(for: commute)
                             CommuteRow(commute: commute)
-                                .id("\(commute.id.uuidString)-\(tripManager.availableTrips.count)-\(tripManager.availableTrips.map { $0.displayName }.joined())")
+                                .id(rowId)
                                 .listRowBackground(DesignSystem.Colors.cardBackground)
                                 .listRowSeparator(.hidden)
                                 .listRowInsets(EdgeInsets(top: DesignSystem.Spacing.xs, leading: DesignSystem.Spacing.md, bottom: DesignSystem.Spacing.xs, trailing: DesignSystem.Spacing.md))
@@ -3816,7 +3895,7 @@ struct ContentView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if !commuteTracker.commutes.isEmpty {
                         Menu {
-                            ShareButton()
+                            ShareLink("Export Summary", item: createCSVFile())
                             
                             Button(role: .destructive) {
                                 showDeleteAllAlert = true
@@ -4108,7 +4187,7 @@ struct ContentView: View {
         Group {
             if !commuteTracker.commutes.isEmpty {
                 Menu {
-                    ForEach(tripManager.filterOptions, id: \.id) { option in
+                    ForEach(tripManager.filterOptions(withCommutes: commuteTracker.commutes), id: \.id) { option in
                         Button(action: {
                             selectedCommuteFilter = option
                         }) {
@@ -4162,7 +4241,7 @@ struct ContentView: View {
             Spacer()
             
             Menu {
-                ForEach(tripManager.filterOptions, id: \.id) { option in
+                ForEach(tripManager.filterOptions(withCommutes: commuteTracker.commutes), id: \.id) { option in
                     Button(action: {
                         selectedCommuteFilter = option
                     }) {
@@ -4226,7 +4305,6 @@ struct ContentView: View {
         for commute in filteredCommutes {
             // Validate each commute before including it
             guard commute.duration > 0 && commute.duration.isFinite else {
-                print("⚠️ Skipping commute with invalid duration: \(commute.duration)")
                 continue
             }
             
@@ -4290,43 +4368,109 @@ struct ContentView: View {
         let averageSlowTrafficTime = count > 0 ? totalSlowTrafficTime / count / 60.0 : 0
         
         return AnyView(CardView {
-            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
                 HStack {
-                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                        Text("Overall Statistics")
-                            .font(DesignSystem.Typography.title2)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Overview")
+                            .font(DesignSystem.Typography.headline)
                             .foregroundColor(DesignSystem.Colors.text)
                         
-                        Text("Based on \(totalCommutes) commute\(totalCommutes == 1 ? "" : "s")")
+                        Text("\(totalCommutes) commute\(totalCommutes == 1 ? "" : "s")")
                             .font(DesignSystem.Typography.caption)
                             .foregroundColor(DesignSystem.Colors.secondaryText)
                     }
                     
                     Spacer()
                     
-                    Image(systemName: "chart.bar.fill")
-                        .font(.title2)
-                        .foregroundColor(DesignSystem.Colors.primary)
+                    CompactStatItem(
+                        title: "Score", 
+                        value: "\(averageDrivingScore)", 
+                        color: scoreColor(averageDrivingScore),
+                        icon: "star.fill"
+                    )
                 }
                 
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 2), spacing: DesignSystem.Spacing.md) {
-                    StatCard(title: "Total Commutes", value: "\(totalCommutes)", color: DesignSystem.Colors.primary, icon: "car.fill")
-                    StatCard(title: "Avg Duration", value: "\(Int(averageDuration))m", color: DesignSystem.Colors.success, icon: "clock.fill")
-                    StatCard(title: "Driving Score", value: "\(averageDrivingScore)", color: scoreColor(averageDrivingScore), icon: "star.fill")
-                    StatCard(title: "Avg Slow Traffic", value: "\(Int(averageSlowTrafficTime))m", color: DesignSystem.Colors.warning, icon: "tortoise.fill")
+                HStack(spacing: DesignSystem.Spacing.lg) {
+                    CompactStatItem(
+                        title: "Duration", 
+                        value: "\(Int(averageDuration))m", 
+                        color: DesignSystem.Colors.success,
+                        icon: "clock"
+                    )
+                    
+                    CompactStatItem(
+                        title: "Traffic", 
+                        value: "\(Int(averageSlowTrafficTime))m", 
+                        color: DesignSystem.Colors.warning,
+                        icon: "tortoise"
+                    )
+                    
+                    Spacer()
+                }
+                
+                // Individual event metrics in compact rows
+                if averageBrakingEvents > 0 || averageAccelerationEvents > 0 || averagePhoneDistractions > 0 || averageHorns > 0 || averageSirens > 0 {
+                    HStack(spacing: DesignSystem.Spacing.md) {
+                        if averageBrakingEvents > 0 {
+                            CompactStatItem(
+                                title: "Braking", 
+                                value: String(format: "%.1f", averageBrakingEvents), 
+                                color: DesignSystem.Colors.error,
+                                icon: "exclamationmark.triangle.fill"
+                            )
+                        }
+                        
+                        if averageAccelerationEvents > 0 {
+                            CompactStatItem(
+                                title: "Acceleration", 
+                                value: String(format: "%.1f", averageAccelerationEvents), 
+                                color: DesignSystem.Colors.accent,
+                                icon: "forward.fill"
+                            )
+                        }
+                        
+                        if averagePhoneDistractions > 0 {
+                            CompactStatItem(
+                                title: "Phone Use", 
+                                value: String(format: "%.1f", averagePhoneDistractions), 
+                                color: DesignSystem.Colors.error,
+                                icon: "iphone"
+                            )
+                        }
+                        
+                        Spacer()
+                    }
+                    
+                    if averageHorns > 0 || averageSirens > 0 {
+                        HStack(spacing: DesignSystem.Spacing.md) {
+                            if averageHorns > 0 {
+                                CompactStatItem(
+                                    title: "Horns", 
+                                    value: String(format: "%.1f", averageHorns), 
+                                    color: DesignSystem.Colors.primary,
+                                    icon: "speaker.wave.3.fill"
+                                )
+                            }
+                            
+                            if averageSirens > 0 {
+                                CompactStatItem(
+                                    title: "Sirens", 
+                                    value: String(format: "%.1f", averageSirens), 
+                                    color: DesignSystem.Colors.accent,
+                                    icon: "music.note"
+                                )
+                            }
+                            
+                            Spacer()
+                        }
+                    }
                 }
                 
                 if averageBrakingEvents > 0 || averageSlowTrafficTime > 0 || averageAccelerationEvents > 0 || averagePhoneDistractions > 0 || averageHorns > 0 || averageSirens > 0 {
                     Divider()
                         .background(DesignSystem.Colors.borderColor)
                     
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 2), spacing: DesignSystem.Spacing.md) {
-                        StatCard(title: "Avg Braking", value: String(format: "%.1f", averageBrakingEvents), color: DesignSystem.Colors.error, icon: "exclamationmark.triangle.fill")
-                        StatCard(title: "Avg Accelerations", value: String(format: "%.1f", averageAccelerationEvents), color: DesignSystem.Colors.accent, icon: "forward.fill")
-                        StatCard(title: "Avg Phone Use", value: String(format: "%.1f", averagePhoneDistractions), color: DesignSystem.Colors.error, icon: "iphone")
-                        StatCard(title: "Avg Horns", value: String(format: "%.1f", averageHorns), color: DesignSystem.Colors.primary, icon: "speaker.wave.3.fill")
-                        StatCard(title: "Avg Sirens", value: String(format: "%.1f", averageSirens), color: DesignSystem.Colors.accent, icon: "music.note")
-                    }
+                    DrivingEventsChart(filteredCommutes: safeCommutes)
                 }
             }
         })
@@ -4369,6 +4513,9 @@ struct ContentView: View {
             .padding()
             .background(trafficPercentageColor(averageTrafficPercentage).opacity(0.1))
             .cornerRadius(12)
+            
+            // Traffic Trends Chart
+            TrafficAnalysisChart(filteredCommutes: filteredCommutes)
             
             // Best vs Worst traffic comparison
             if let bestCommute = bestTrafficCommute, let worstCommute = worstTrafficCommute, 
@@ -4501,37 +4648,6 @@ struct ContentView: View {
         .cornerRadius(8)
     }
     
-    func TrafficTrendsChart(filteredCommutes: [CommuteRecord]) -> some View {
-        let recentCommutes = Array(filteredCommutes.prefix(10).reversed())
-        
-        return VStack(alignment: .leading, spacing: 12) {
-            Text("Recent Traffic Trend")
-                .font(.subheadline)
-                .fontWeight(.semibold)
-            
-            if !recentCommutes.isEmpty {
-                VStack(spacing: 8) {
-                    HStack(alignment: .bottom, spacing: 4) {
-                        ForEach(0..<recentCommutes.count, id: \.self) { index in
-                            let commute = recentCommutes[index]
-                            let trafficPercentage = commute.duration > 0 ? (commute.drivingMetrics.slowTrafficTime / commute.duration) * 100 : 0
-                            let height = max(CGFloat(trafficPercentage) / 50.0 * 40, 2) // Scale to 50% max, min 2px height
-                            
-                            Rectangle()
-                                .fill(trafficPercentageColor(trafficPercentage))
-                                .frame(width: 20, height: height)
-                                .cornerRadius(2)
-                        }
-                    }
-                    .frame(height: 50)
-                    
-                    Text("Traffic percentage over last \(recentCommutes.count) commutes")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-        }
-    }
     
     private func calculateAverageTrafficPercentage(_ commutes: [CommuteRecord]) -> Double {
         guard !commutes.isEmpty else { return 0 }
@@ -4564,7 +4680,7 @@ struct ContentView: View {
     
     
     func DrivingTrendsChart(filteredCommutes: [CommuteRecord]) -> some View {
-        let recentCommutes = Array(filteredCommutes.prefix(10).reversed())
+        let recentCommutes = Array(filteredCommutes.suffix(10))
         
         return VStack(alignment: .leading, spacing: 8) {
             Text("Recent Driving Trend")
@@ -4572,21 +4688,31 @@ struct ContentView: View {
                 .fontWeight(.semibold)
             
             if !recentCommutes.isEmpty {
-                HStack(alignment: .bottom, spacing: 4) {
-                    ForEach(0..<recentCommutes.count, id: \.self) { index in
-                        let commute = recentCommutes[index]
-                        let height = CGFloat(commute.drivingMetrics.drivingScore) / 100.0 * 40
-                        
-                        Rectangle()
-                            .fill(scoreColor(commute.drivingMetrics.drivingScore))
-                            .frame(width: 20, height: height)
-                            .cornerRadius(2)
-                    }
-                    Spacer()
+                Chart(recentCommutes.indices, id: \.self) { index in
+                    let commute = recentCommutes[index]
+                    BarMark(
+                        x: .value("Trip", index + 1),
+                        y: .value("Score", commute.drivingMetrics.drivingScore)
+                    )
+                    .foregroundStyle(scoreColor(commute.drivingMetrics.drivingScore))
+                    .cornerRadius(2)
                 }
-                .frame(height: 50)
+                .frame(height: 120)
+                .chartYScale(domain: 0...100)
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: min(recentCommutes.count, 5))) { _ in
+                        AxisGridLine()
+                        AxisValueLabel()
+                    }
+                }
+                .chartYAxis {
+                    AxisMarks(values: [0, 25, 50, 75, 100]) { value in
+                        AxisGridLine()
+                        AxisValueLabel("\(value.as(Int.self) ?? 0)")
+                    }
+                }
                 
-                Text("Showing last \(recentCommutes.count) commutes")
+                Text("Showing last \(recentCommutes.count) commutes • Score out of 100")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -4648,7 +4774,7 @@ struct ContentView: View {
         let weeklyInsights = getWeeklyInsights(from: filteredCommutes)
         
         return VStack(alignment: .leading, spacing: 16) {
-            Text("Weekly Insights")
+            Text("Weekly Analysis")
                 .font(.title2)
                 .fontWeight(.bold)
             
@@ -4658,12 +4784,9 @@ struct ContentView: View {
                     .multilineTextAlignment(.center)
                     .padding()
             } else {
-                VStack(spacing: 12) {
-                    ForEach(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"], id: \.self) { day in
-                        if let dayCommutes = weeklyInsights[day], !dayCommutes.isEmpty {
-                            InsightRow(day: day, commutes: dayCommutes)
-                        }
-                    }
+                VStack(spacing: 16) {
+                    BestDepartureTimesTable(weeklyData: weeklyInsights)
+                    WeeklyAverageScoreChart(weeklyData: weeklyInsights)
                 }
             }
         }
@@ -4800,6 +4923,279 @@ struct ContentView: View {
         recommendation += ")"
         
         return recommendation
+    }
+    
+    // MARK: - Chart Views
+    func BestDepartureTimesTable(weeklyData: [String: [CommuteRecord]]) -> some View {
+        let weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Best Departure Times")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+            
+            VStack(spacing: 0) {
+                ForEach(weekdays, id: \.self) { day in
+                    DepartureTimeRow(day: day, commutes: weeklyData[day] ?? [])
+                    
+                    if day != weekdays.last {
+                        Divider()
+                            .background(DesignSystem.Colors.borderColor)
+                    }
+                }
+            }
+            .background(DesignSystem.Colors.cardBackground)
+            .cornerRadius(8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(DesignSystem.Colors.borderColor, lineWidth: 1)
+            )
+            
+            Text("Based on shortest trip duration and least traffic")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+    
+    func DepartureTimeRow(day: String, commutes: [CommuteRecord]) -> some View {
+        HStack {
+            Text(day)
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .foregroundColor(DesignSystem.Colors.text)
+                .frame(width: 80, alignment: .leading)
+            
+            Spacer()
+            
+            if commutes.isEmpty {
+                Text("No data")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .italic()
+            } else {
+                let insight = calculateOptimalDepartureWindow(for: commutes)
+                Text(insight)
+                    .font(.caption)
+                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                    .multilineTextAlignment(.trailing)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+    
+    func WeeklyAverageScoreChart(weeklyData: [String: [CommuteRecord]]) -> some View {
+        let weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        let chartData = weekdays.compactMap { day -> (day: String, score: Double)? in
+            guard let commutes = weeklyData[day], !commutes.isEmpty else { return nil }
+            let averageScore = commutes.map { Double($0.drivingMetrics.drivingScore) }.reduce(0, +) / Double(commutes.count)
+            return (day: String(day.prefix(3)), score: averageScore)
+        }
+        
+        guard !chartData.isEmpty else {
+            return AnyView(
+                Text("No data available for weekly score trends")
+                    .foregroundColor(.secondary)
+                    .font(.caption)
+            )
+        }
+        
+        return AnyView(VStack(alignment: .leading, spacing: 8) {
+            Text("Average Score by Day")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+            
+            Chart(chartData, id: \.day) { data in
+                LineMark(
+                    x: .value("Day", data.day),
+                    y: .value("Score", data.score)
+                )
+                .foregroundStyle(DesignSystem.Colors.accent)
+                .lineStyle(StrokeStyle(lineWidth: 3))
+                
+                PointMark(
+                    x: .value("Day", data.day),
+                    y: .value("Score", data.score)
+                )
+                .foregroundStyle(DesignSystem.Colors.accent)
+                .symbol(Circle())
+                .symbolSize(60)
+            }
+            .frame(height: 120)
+            .chartYScale(domain: 0...100)
+            .chartYAxis {
+                AxisMarks(values: [0, 25, 50, 75, 100]) { value in
+                    AxisGridLine()
+                    AxisValueLabel("\(value.as(Int.self) ?? 0)")
+                }
+            }
+            .chartXAxis {
+                AxisMarks { _ in
+                    AxisValueLabel()
+                }
+            }
+        })
+    }
+    
+    func TrafficAnalysisChart(filteredCommutes: [CommuteRecord]) -> some View {
+        let recentCommutes = Array(filteredCommutes.suffix(10))
+        
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Traffic Impact Over Time")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+            
+            if !recentCommutes.isEmpty {
+                Chart(recentCommutes.indices, id: \.self) { index in
+                    let commute = recentCommutes[index]
+                    let trafficPercentage = commute.duration > 0 ? (commute.drivingMetrics.slowTrafficTime / commute.duration) * 100 : 0
+                    
+                    AreaMark(
+                        x: .value("Trip", index + 1),
+                        y: .value("Traffic %", trafficPercentage)
+                    )
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [DesignSystem.Colors.warning.opacity(0.3), DesignSystem.Colors.warning.opacity(0.1)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    
+                    LineMark(
+                        x: .value("Trip", index + 1),
+                        y: .value("Traffic %", trafficPercentage)
+                    )
+                    .foregroundStyle(DesignSystem.Colors.warning)
+                    .lineStyle(StrokeStyle(lineWidth: 2))
+                }
+                .frame(height: 100)
+                .chartYScale(domain: 0...100)
+                .chartYAxis {
+                    AxisMarks(values: .automatic(desiredCount: 4)) { value in
+                        AxisGridLine()
+                        AxisValueLabel("\(Int(value.as(Double.self) ?? 0))%")
+                    }
+                }
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: min(recentCommutes.count, 5))) { _ in
+                        AxisGridLine()
+                        AxisValueLabel()
+                    }
+                }
+                
+                Text("Traffic time as % of total trip duration")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+    
+    func DrivingEventsChart(filteredCommutes: [CommuteRecord]) -> some View {
+        let recentCommutes = Array(filteredCommutes.suffix(5))
+        let maxEventTotal = recentCommutes.map { commute in
+            commute.drivingMetrics.brakingEventCount + 
+            commute.drivingMetrics.accelerationEvents + 
+            commute.drivingMetrics.phoneDistractions + 
+            commute.drivingMetrics.hornEvents
+        }.max() ?? 0
+        
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Recent Events Breakdown")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+            
+            if !recentCommutes.isEmpty {
+                Chart(recentCommutes.indices, id: \.self) { index in
+                    let commute = recentCommutes[index]
+                    
+                    BarMark(
+                        x: .value("Trip", "Trip \(index + 1)"),
+                        y: .value("Braking", commute.drivingMetrics.brakingEventCount),
+                        stacking: .standard
+                    )
+                    .foregroundStyle(DesignSystem.Colors.error)
+                    
+                    BarMark(
+                        x: .value("Trip", "Trip \(index + 1)"),
+                        y: .value("Acceleration", commute.drivingMetrics.accelerationEvents),
+                        stacking: .standard
+                    )
+                    .foregroundStyle(DesignSystem.Colors.accent)
+                    
+                    BarMark(
+                        x: .value("Trip", "Trip \(index + 1)"),
+                        y: .value("Phone", commute.drivingMetrics.phoneDistractions),
+                        stacking: .standard
+                    )
+                    .foregroundStyle(Color.orange)
+                    
+                    BarMark(
+                        x: .value("Trip", "Trip \(index + 1)"),
+                        y: .value("Horn", commute.drivingMetrics.hornEvents),
+                        stacking: .standard
+                    )
+                    .foregroundStyle(DesignSystem.Colors.primary)
+                }
+                .frame(height: 120)
+                .chartYScale(domain: 0...max(maxEventTotal + 2, 10))
+                .chartYAxis {
+                    AxisMarks(values: .automatic(desiredCount: 4)) { value in
+                        AxisGridLine()
+                        AxisValueLabel("\(value.as(Int.self) ?? 0)")
+                    }
+                }
+                .chartForegroundStyleScale([
+                    "Braking": DesignSystem.Colors.error,
+                    "Acceleration": DesignSystem.Colors.accent,
+                    "Phone": Color.orange,
+                    "Horn": DesignSystem.Colors.primary
+                ])
+                .chartLegend(position: .bottom, alignment: .center) {
+                    HStack(spacing: 16) {
+                        LegendItem(color: DesignSystem.Colors.error, text: "Braking")
+                        LegendItem(color: DesignSystem.Colors.accent, text: "Acceleration")
+                        LegendItem(color: Color.orange, text: "Phone")
+                        LegendItem(color: DesignSystem.Colors.primary, text: "Horn")
+                    }
+                }
+                
+                Text("Stacked events per trip (last 5 commutes)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+    
+    func CompactStatItem(title: String, value: String, color: Color, icon: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundColor(color)
+                .frame(width: 12)
+            
+            VStack(alignment: .leading, spacing: 1) {
+                Text(value)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundColor(color)
+                
+                Text(title)
+                    .font(.caption2)
+                    .foregroundColor(DesignSystem.Colors.secondaryText)
+            }
+        }
+    }
+    
+    func LegendItem(color: Color, text: String) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(text)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
     }
     
     // MARK: - Settings View
@@ -5106,7 +5502,8 @@ struct ContentView: View {
                                         )
                                 }
                                 
-                                HStack(spacing: DesignSystem.Spacing.md) {
+                                VStack(spacing: DesignSystem.Spacing.sm) {
+                                    // Export Button
                                     AnimatedButton(action: {
                                         if let data = commuteTracker.exportAllData() {
                                             let filename = "MyCommute_Backup_\(DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .none).replacingOccurrences(of: "/", with: "_")).json"
@@ -5115,24 +5512,22 @@ struct ContentView: View {
                                     }) {
                                         HStack {
                                             Image(systemName: "square.and.arrow.up")
-                                                .font(.caption)
-                                            Text("Export")
-                                                .font(DesignSystem.Typography.caption)
+                                                .font(.subheadline)
+                                            Text("Export Data")
+                                                .font(DesignSystem.Typography.subheadline)
                                                 .fontWeight(.medium)
+                                            Spacer()
                                         }
-                                        .foregroundColor(DesignSystem.Colors.primary)
-                                        .padding(.horizontal, DesignSystem.Spacing.md)
-                                        .padding(.vertical, DesignSystem.Spacing.sm)
+                                        .foregroundColor(.white)
+                                        .padding(.horizontal, DesignSystem.Spacing.lg)
+                                        .padding(.vertical, DesignSystem.Spacing.md)
                                         .background(
-                                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                                .fill(DesignSystem.Colors.primary.opacity(0.1))
-                                                .overlay(
-                                                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                                        .stroke(DesignSystem.Colors.primary, lineWidth: 1)
-                                                )
+                                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
+                                                .fill(DesignSystem.Colors.primary)
                                         )
                                     }
                                     
+                                    // Import Button
                                     Menu {
                                         Button(action: {
                                             showDocumentPicker = true
@@ -5148,21 +5543,18 @@ struct ContentView: View {
                                     } label: {
                                         HStack {
                                             Image(systemName: "square.and.arrow.down")
-                                                .font(.caption)
-                                            Text("Import")
-                                                .font(DesignSystem.Typography.caption)
+                                                .font(.subheadline)
+                                            Text("Import Data")
+                                                .font(DesignSystem.Typography.subheadline)
                                                 .fontWeight(.medium)
+                                            Spacer()
                                         }
-                                        .foregroundColor(DesignSystem.Colors.secondary)
-                                        .padding(.horizontal, DesignSystem.Spacing.md)
-                                        .padding(.vertical, DesignSystem.Spacing.sm)
+                                        .foregroundColor(DesignSystem.Colors.primary)
+                                        .padding(.horizontal, DesignSystem.Spacing.lg)
+                                        .padding(.vertical, DesignSystem.Spacing.md)
                                         .background(
-                                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                                .fill(DesignSystem.Colors.secondary.opacity(0.1))
-                                                .overlay(
-                                                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                                        .stroke(DesignSystem.Colors.secondary, lineWidth: 1)
-                                                )
+                                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
+                                                .fill(DesignSystem.Colors.primary.opacity(0.1))
                                         )
                                     }
                                     
@@ -5215,6 +5607,56 @@ struct ContentView: View {
                                     .font(DesignSystem.Typography.caption)
                                     .foregroundColor(DesignSystem.Colors.secondaryText)
                                     .multilineTextAlignment(.leading)
+                                
+                                Divider()
+                                    .background(DesignSystem.Colors.borderColor)
+                                
+                                // Algorithm explanation links
+                                VStack(spacing: DesignSystem.Spacing.sm) {
+                                    Button(action: {
+                                        showDriveQualityExplanation = true
+                                    }) {
+                                        HStack {
+                                            Image(systemName: "chart.line.uptrend.xyaxis")
+                                                .foregroundColor(DesignSystem.Colors.primary)
+                                                .frame(width: 20)
+                                            
+                                            Text("How Drive Quality is Calculated")
+                                                .font(DesignSystem.Typography.subheadline)
+                                                .foregroundColor(DesignSystem.Colors.text)
+                                            
+                                            Spacer()
+                                            
+                                            Image(systemName: "chevron.right")
+                                                .font(.caption)
+                                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                                        }
+                                        .padding(.vertical, DesignSystem.Spacing.xs)
+                                    }
+                                    .buttonStyle(.plain)
+                                    
+                                    Button(action: {
+                                        showDepartureTimeExplanation = true
+                                    }) {
+                                        HStack {
+                                            Image(systemName: "clock.arrow.circlepath")
+                                                .foregroundColor(DesignSystem.Colors.primary)
+                                                .frame(width: 20)
+                                            
+                                            Text("How We Find the Best Time to Leave")
+                                                .font(DesignSystem.Typography.subheadline)
+                                                .foregroundColor(DesignSystem.Colors.text)
+                                            
+                                            Spacer()
+                                            
+                                            Image(systemName: "chevron.right")
+                                                .font(.caption)
+                                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                                        }
+                                        .padding(.vertical, DesignSystem.Spacing.xs)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
                             }
                         }
                     }
@@ -5426,7 +5868,6 @@ struct ContentView: View {
                     SpeedLegendView()
                     
                     Button(action: {
-                        print("🗺️ Map button tapped for commute: \(commute.id)")
                         fullScreenMapCommute = commute
                     }) {
                         TripMapView(commute: commute)
@@ -5548,10 +5989,8 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            print("🗺️ Full screen map appearing for commute: \(commute.id)")
         }
         .onDisappear {
-            print("🗺️ Full screen map disappearing")
         }
     }
 
@@ -5582,7 +6021,7 @@ struct ContentView: View {
         do {
             try csvContent.write(to: fileURL, atomically: true, encoding: .utf8)
         } catch {
-            print("Error creating CSV file: \(error)")
+            // File creation error handled silently - ShareLink will still work
         }
         
         return fileURL
@@ -5597,7 +6036,7 @@ struct ContentView: View {
         do {
             try csvContent.write(to: fileURL, atomically: true, encoding: .utf8)
         } catch {
-            print("Error creating detailed GPS CSV file: \(error)")
+            // File creation error handled silently - ShareLink will still work
         }
         
         return fileURL
@@ -5609,11 +6048,11 @@ struct ContentView: View {
         guard settingsManager.useLocationBasedOrdering,
               !commuteTracker.commutes.isEmpty,
               let currentLocation = locationManager.currentLocation else {
-            return tripManager.availableTrips // Return default order if disabled or no data
+            return tripManager.regularTrips // Return regular trips only (excludes one-off)
         }
         
         // Calculate relevance scores for each trip
-        let tripScores = tripManager.availableTrips.map { trip in
+        let tripScores = tripManager.regularTrips.map { trip in
             let score = calculateTripRelevanceScore(trip: trip, currentLocation: currentLocation)
             return (trip: trip, score: score)
         }
@@ -6110,11 +6549,11 @@ struct TripEditorView: View {
     var body: some View {
         NavigationView {
             List {
-                Section("Available Trips") {
-                    ForEach(tripManager.availableTrips, id: \.id) { trip in
+                Section("Available Commutes") {
+                    ForEach(tripManager.regularTrips, id: \.id) { trip in
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                TextField("Trip name", text: Binding(
+                                TextField("Commute name", text: Binding(
                                     get: { tempTripNames[trip.id] ?? trip.displayName },
                                     set: { newValue in
                                         tempTripNames[trip.id] = newValue
@@ -6186,8 +6625,8 @@ struct TripEditorView: View {
                 }
                 
                 if tripManager.canAddMoreTrips() {
-                    Section("Add New Trip") {
-                        Button("Add Custom Trip") {
+                    Section("Add New Commute") {
+                        Button("Add Custom Commute") {
                             newTripName = ""
                             addTripErrorMessage = ""
                             showAddTripSheet = true
@@ -6196,13 +6635,13 @@ struct TripEditorView: View {
                     }
                 } else {
                     Section("Limit Reached") {
-                        Text("You can have up to 8 trips total")
+                        Text("You can have up to 8 commutes total")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
                 }
             }
-            .navigationTitle("Edit Trips")
+            .navigationTitle("Edit Commutes")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
@@ -6293,7 +6732,7 @@ struct TripEditorView: View {
     }
 }
 
-// MARK: - Add Trip Sheet
+// MARK: - Add Commute Sheet
 struct AddTripSheet: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var tripManager: TripManager
@@ -6305,10 +6744,10 @@ struct AddTripSheet: View {
         NavigationView {
             VStack(spacing: 20) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Trip Name")
+                    Text("Commute Name")
                         .font(.headline)
                     
-                    TextField("Enter trip name", text: $tripName)
+                    TextField("Enter commute name", text: $tripName)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                         .onSubmit {
                             if onSave(tripName) {
@@ -6330,7 +6769,7 @@ struct AddTripSheet: View {
                 Spacer()
             }
             .padding()
-            .navigationTitle("Add Custom Trip")
+            .navigationTitle("Add Custom Commute")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -6507,6 +6946,641 @@ struct OnboardingPageView: View {
             
             Spacer()
         }
+    }
+}
+
+// MARK: - Drive Quality Explanation View
+struct DriveQualityExplanationView: View {
+    @Environment(\.dismiss) private var dismiss
+    
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    // Header
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("How Drive Quality is Calculated")
+                            .font(.largeTitle)
+                            .fontWeight(.bold)
+                            .foregroundColor(DesignSystem.Colors.text)
+                        
+                        Text("A comprehensive analysis of your driving behavior using real-time sensor data")
+                            .font(.subheadline)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                    }
+                    
+                    // Overview Section
+                    ExplanationSection(
+                        title: "Algorithm Overview",
+                        icon: "brain.head.profile",
+                        content: {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Our drive quality algorithm combines multiple data sources to provide a comprehensive assessment of your driving:")
+                                    .font(.body)
+                                
+                                ForEach([
+                                    "📱 Motion sensors (accelerometer, gyroscope)",
+                                    "🗺️ GPS data (speed, location, route)",
+                                    "🎤 Audio analysis (horn/siren detection)",
+                                    "🚦 Traffic conditions and timing"
+                                ], id: \.self) { item in
+                                    Text(item)
+                                        .font(.callout)
+                                        .padding(.leading, 16)
+                                }
+                            }
+                        }
+                    )
+                    
+                    // Scoring Components
+                    ExplanationSection(
+                        title: "Scoring Components",
+                        icon: "chart.bar.fill",
+                        content: {
+                            VStack(alignment: .leading, spacing: 16) {
+                                ScoreComponent(
+                                    name: "Smooth Driving",
+                                    weight: "40%",
+                                    description: "Measures sudden accelerations, hard braking, and jerky movements using device motion sensors",
+                                    color: .green
+                                )
+                                
+                                ScoreComponent(
+                                    name: "Speed Management",
+                                    weight: "25%",
+                                    description: "Evaluates adherence to speed limits and consistent speed maintenance",
+                                    color: .blue
+                                )
+                                
+                                ScoreComponent(
+                                    name: "Traffic Adaptation",
+                                    weight: "20%",
+                                    description: "Assesses how well you handle slow traffic and congested conditions",
+                                    color: .orange
+                                )
+                                
+                                ScoreComponent(
+                                    name: "Environmental Awareness",
+                                    weight: "10%",
+                                    description: "Considers phone usage, horn/siren events, and external factors",
+                                    color: .purple
+                                )
+                                
+                                ScoreComponent(
+                                    name: "Route Efficiency",
+                                    weight: "5%",
+                                    description: "Evaluates path optimization and turn smoothness",
+                                    color: .teal
+                                )
+                            }
+                        }
+                    )
+                    
+                    // Technical Details
+                    ExplanationSection(
+                        title: "Technical Implementation",
+                        icon: "gearshape.2.fill",
+                        content: {
+                            VStack(alignment: .leading, spacing: 16) {
+                                TechnicalDetail(
+                                    title: "Motion Analysis",
+                                    details: [
+                                        "Samples accelerometer data at 50Hz",
+                                        "Applies low-pass filter to reduce noise",
+                                        "Detects acceleration spikes > 0.3g",
+                                        "Uses gyroscope for turn smoothness"
+                                    ]
+                                )
+                                
+                                TechnicalDetail(
+                                    title: "GPS Processing",
+                                    details: [
+                                        "Updates location every 2 seconds",
+                                        "Calculates real-time speed and direction",
+                                        "Maps speed against regional limits",
+                                        "Identifies traffic patterns"
+                                    ]
+                                )
+                                
+                                TechnicalDetail(
+                                    title: "Audio Recognition",
+                                    details: [
+                                        "Real-time audio classification using Core ML",
+                                        "Detects car horns with 85% accuracy",
+                                        "Identifies emergency sirens",
+                                        "Filters background noise automatically"
+                                    ]
+                                )
+                            }
+                        }
+                    )
+                    
+                    // Score Calculation
+                    ExplanationSection(
+                        title: "Final Score Calculation",
+                        icon: "function",
+                        content: {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("The final score is calculated using a weighted formula:")
+                                    .font(.body)
+                                    .fontWeight(.medium)
+                                
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Score = (Smooth × 0.4) + (Speed × 0.25) + (Traffic × 0.2) + (Awareness × 0.1) + (Route × 0.05)")
+                                        .font(.system(.body, design: .monospaced))
+                                        .padding()
+                                        .background(Color.gray.opacity(0.1))
+                                        .cornerRadius(8)
+                                    
+                                    Text("Each component is normalized to 0-100, then penalties are applied for:")
+                                        .font(.callout)
+                                    
+                                    ForEach([
+                                        "Hard braking events (-5 points each)",
+                                        "Rapid acceleration (-3 points each)",
+                                        "Phone usage during driving (-10 points)",
+                                        "Excessive time in slow traffic (-2 points per minute)",
+                                        "Horn usage in dense areas (-1 point each)"
+                                    ], id: \.self) { penalty in
+                                        Text("• \(penalty)")
+                                            .font(.caption)
+                                            .padding(.leading, 12)
+                                    }
+                                }
+                            }
+                        }
+                    )
+                    
+                    // Quality Ranges
+                    ExplanationSection(
+                        title: "Quality Ratings",
+                        icon: "star.fill",
+                        content: {
+                            VStack(spacing: 12) {
+                                QualityRange(range: "90-100", label: "Excellent", description: "Exceptional driving with minimal events", color: .green)
+                                QualityRange(range: "80-89", label: "Good", description: "Solid driving with minor improvements needed", color: .blue)
+                                QualityRange(range: "70-79", label: "Average", description: "Acceptable driving with room for improvement", color: .orange)
+                                QualityRange(range: "60-69", label: "Fair", description: "Some concerning driving behaviors detected", color: .yellow)
+                                QualityRange(range: "0-59", label: "Poor", description: "Significant driving issues requiring attention", color: .red)
+                            }
+                        }
+                    )
+                }
+                .padding(24)
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Departure Time Explanation View
+struct DepartureTimeExplanationView: View {
+    @Environment(\.dismiss) private var dismiss
+    
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    // Header
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("How We Find the Best Time to Leave")
+                            .font(.largeTitle)
+                            .fontWeight(.bold)
+                            .foregroundColor(DesignSystem.Colors.text)
+                        
+                        Text("Advanced temporal analysis to optimize your commute timing")
+                            .font(.subheadline)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                    }
+                    
+                    // Algorithm Overview
+                    ExplanationSection(
+                        title: "Time Window Analysis",
+                        icon: "clock.arrow.circlepath",
+                        content: {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Our algorithm analyzes your historical commute data to identify optimal departure windows:")
+                                    .font(.body)
+                                
+                                ForEach([
+                                    "⏰ Divides each day into 10-minute windows",
+                                    "📊 Analyzes trip duration patterns",
+                                    "🚦 Measures traffic impact per window",
+                                    "🎯 Identifies consistent optimal times"
+                                ], id: \.self) { item in
+                                    Text(item)
+                                        .font(.callout)
+                                        .padding(.leading, 16)
+                                }
+                            }
+                        }
+                    )
+                    
+                    // Data Collection
+                    ExplanationSection(
+                        title: "Data Collection Process",
+                        icon: "chart.line.uptrend.xyaxis",
+                        content: {
+                            VStack(alignment: .leading, spacing: 16) {
+                                DataCollectionStep(
+                                    step: "1",
+                                    title: "Trip Segmentation",
+                                    description: "Each trip is categorized by day of week and departure time",
+                                    technical: "Maps startTime to window index: (hour × 6) + (minute ÷ 10)"
+                                )
+                                
+                                DataCollectionStep(
+                                    step: "2",
+                                    title: "Duration Tracking",
+                                    description: "Records total trip time from start to destination",
+                                    technical: "Measures endTime - startTime with GPS precision"
+                                )
+                                
+                                DataCollectionStep(
+                                    step: "3",
+                                    title: "Traffic Analysis",
+                                    description: "Calculates time spent in slow-moving traffic",
+                                    technical: "Detects speeds < 15 km/h for > 30 seconds"
+                                )
+                                
+                                DataCollectionStep(
+                                    step: "4",
+                                    title: "Pattern Recognition",
+                                    description: "Identifies recurring delays and optimal windows",
+                                    technical: "Requires minimum 3 trips per window for reliability"
+                                )
+                            }
+                        }
+                    )
+                    
+                    // Scoring Algorithm
+                    ExplanationSection(
+                        title: "Optimal Time Scoring",
+                        icon: "function",
+                        content: {
+                            VStack(alignment: .leading, spacing: 16) {
+                                Text("Each 10-minute window receives a score based on:")
+                                    .font(.body)
+                                    .fontWeight(.medium)
+                                
+                                VStack(alignment: .leading, spacing: 12) {
+                                    ScoreFormula(
+                                        component: "Average Duration",
+                                        weight: "60%",
+                                        description: "Lower trip times score better"
+                                    )
+                                    
+                                    ScoreFormula(
+                                        component: "Traffic Time",
+                                        weight: "40%",
+                                        description: "Less slow traffic is heavily weighted"
+                                    )
+                                }
+                                
+                                Text("Final Formula:")
+                                    .font(.headline)
+                                    .padding(.top, 8)
+                                
+                                Text("Score = avgDuration + (avgTrafficTime × 2.0)")
+                                    .font(.system(.body, design: .monospaced))
+                                    .padding()
+                                    .background(Color.gray.opacity(0.1))
+                                    .cornerRadius(8)
+                                
+                                Text("The window with the lowest score is recommended as optimal.")
+                                    .font(.caption)
+                                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                                    .italic()
+                            }
+                        }
+                    )
+                    
+                    // Example Calculation
+                    ExplanationSection(
+                        title: "Example Calculation",
+                        icon: "chart.bar.doc.horizontal",
+                        content: {
+                            VStack(alignment: .leading, spacing: 16) {
+                                Text("Monday Morning Analysis:")
+                                    .font(.headline)
+                                
+                                VStack(spacing: 8) {
+                                    TimeWindowExample(
+                                        time: "7:00-7:10",
+                                        avgDuration: "28 min",
+                                        trafficTime: "8 min",
+                                        score: "44.0",
+                                        isOptimal: false
+                                    )
+                                    
+                                    TimeWindowExample(
+                                        time: "7:10-7:20",
+                                        avgDuration: "25 min",
+                                        trafficTime: "5 min",
+                                        score: "35.0",
+                                        isOptimal: true
+                                    )
+                                    
+                                    TimeWindowExample(
+                                        time: "7:20-7:30",
+                                        avgDuration: "32 min",
+                                        trafficTime: "12 min",
+                                        score: "56.0",
+                                        isOptimal: false
+                                    )
+                                }
+                                
+                                Text("✅ Recommendation: Leave between 7:10-7:20 AM")
+                                    .font(.callout)
+                                    .fontWeight(.medium)
+                                    .foregroundColor(.green)
+                                    .padding()
+                                    .background(Color.green.opacity(0.1))
+                                    .cornerRadius(8)
+                            }
+                        }
+                    )
+                    
+                    // Machine Learning
+                    ExplanationSection(
+                        title: "Adaptive Learning",
+                        icon: "brain.head.profile",
+                        content: {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("The algorithm continuously improves its recommendations:")
+                                    .font(.body)
+                                
+                                ForEach([
+                                    "🔄 Updates with each new trip",
+                                    "📈 Weighs recent data more heavily",
+                                    "🗓️ Accounts for seasonal patterns",
+                                    "🚧 Adapts to route changes",
+                                    "📊 Considers traffic variability"
+                                ], id: \.self) { feature in
+                                    Text(feature)
+                                        .font(.callout)
+                                        .padding(.leading, 16)
+                                }
+                                
+                                Text("Minimum Data Requirements:")
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+                                    .padding(.top, 8)
+                                
+                                Text("• At least 5 trips on the same weekday\n• Minimum 3 trips in a specific time window\n• Data from last 30 days weighted most heavily")
+                                    .font(.caption)
+                                    .padding(.leading, 12)
+                            }
+                        }
+                    )
+                }
+                .padding(24)
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Helper Views for Explanations
+struct ExplanationSection<Content: View>: View {
+    let title: String
+    let icon: String
+    let content: () -> Content
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Image(systemName: icon)
+                    .foregroundColor(DesignSystem.Colors.primary)
+                    .font(.title2)
+                
+                Text(title)
+                    .font(.title2)
+                    .fontWeight(.bold)
+                    .foregroundColor(DesignSystem.Colors.text)
+            }
+            
+            content()
+        }
+        .padding()
+        .background(DesignSystem.Colors.cardBackground)
+        .cornerRadius(12)
+        .shadow(radius: 2)
+    }
+}
+
+struct ScoreComponent: View {
+    let name: String
+    let weight: String
+    let description: String
+    let color: Color
+    
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+                .padding(.top, 6)
+            
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(name)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                    
+                    Spacer()
+                    
+                    Text(weight)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(color)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(color.opacity(0.2))
+                        .cornerRadius(4)
+                }
+                
+                Text(description)
+                    .font(.caption)
+                    .foregroundColor(DesignSystem.Colors.secondaryText)
+            }
+        }
+    }
+}
+
+struct TechnicalDetail: View {
+    let title: String
+    let details: [String]
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.subheadline)
+                .fontWeight(.medium)
+            
+            ForEach(details, id: \.self) { detail in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("•")
+                        .foregroundColor(DesignSystem.Colors.primary)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundColor(DesignSystem.Colors.secondaryText)
+                }
+            }
+        }
+    }
+}
+
+struct QualityRange: View {
+    let range: String
+    let label: String
+    let description: String
+    let color: Color
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(range)
+                .font(.system(.caption, design: .monospaced))
+                .fontWeight(.medium)
+                .foregroundColor(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(color)
+                .cornerRadius(6)
+                .frame(width: 60)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                Text(description)
+                    .font(.caption)
+                    .foregroundColor(DesignSystem.Colors.secondaryText)
+            }
+            
+            Spacer()
+        }
+    }
+}
+
+struct DataCollectionStep: View {
+    let step: String
+    let title: String
+    let description: String
+    let technical: String
+    
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(step)
+                .font(.caption)
+                .fontWeight(.bold)
+                .foregroundColor(.white)
+                .frame(width: 20, height: 20)
+                .background(DesignSystem.Colors.primary)
+                .clipShape(Circle())
+            
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                Text(description)
+                    .font(.caption)
+                    .foregroundColor(DesignSystem.Colors.text)
+                
+                Text(technical)
+                    .font(.caption)
+                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                    .italic()
+            }
+        }
+    }
+}
+
+struct ScoreFormula: View {
+    let component: String
+    let weight: String
+    let description: String
+    
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(component)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                Text(description)
+                    .font(.caption)
+                    .foregroundColor(DesignSystem.Colors.secondaryText)
+            }
+            
+            Spacer()
+            
+            Text(weight)
+                .font(.caption)
+                .fontWeight(.medium)
+                .foregroundColor(DesignSystem.Colors.primary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(DesignSystem.Colors.primary.opacity(0.2))
+                .cornerRadius(4)
+        }
+    }
+}
+
+struct TimeWindowExample: View {
+    let time: String
+    let avgDuration: String
+    let trafficTime: String
+    let score: String
+    let isOptimal: Bool
+    
+    var body: some View {
+        HStack {
+            Text(time)
+                .font(.system(.caption, design: .monospaced))
+                .frame(width: 80, alignment: .leading)
+            
+            Text(avgDuration)
+                .font(.caption)
+                .frame(width: 50, alignment: .center)
+            
+            Text(trafficTime)
+                .font(.caption)
+                .frame(width: 50, alignment: .center)
+            
+            Text(score)
+                .font(.system(.caption, design: .monospaced))
+                .frame(width: 40, alignment: .trailing)
+            
+            if isOptimal {
+                Image(systemName: "star.fill")
+                    .foregroundColor(.yellow)
+                    .font(.caption)
+            } else {
+                Spacer()
+                    .frame(width: 16)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(isOptimal ? Color.green.opacity(0.1) : Color.clear)
+        .cornerRadius(6)
     }
 }
 
