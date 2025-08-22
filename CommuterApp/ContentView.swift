@@ -430,8 +430,16 @@ struct DrivingMetrics: Codable {
     var slowTrafficTime: TimeInterval = 0.0 // Time spent under 15 km/h
     var accelerationEvents: Int = 0 // Number of significant acceleration events
     var phoneDistractions: Int = 0 // Phone interaction events (touches + orientation changes)
-    var carHornEvents: Int = 0 // Number of car horn detections
+    var hornEvents: Int = 0 // Number of horn detections
     var sirenEvents: Int = 0 // Number of siren detections
+    
+    // Custom CodingKeys for backward compatibility
+    private enum CodingKeys: String, CodingKey {
+        case brakingEventCount, hardBrakingEventCount, maxSpeed, averageSpeed
+        case roughRoadEvents, sharpTurns, speedViolations, totalDistance, slowTrafficTime
+        case accelerationEvents, phoneDistractions, hornEvents, sirenEvents
+        case carHornEvents = "carHornEvents" // Legacy key for backward compatibility
+    }
     
     // Custom decoder for backward compatibility
     init(from decoder: Decoder) throws {
@@ -451,8 +459,36 @@ struct DrivingMetrics: Codable {
         // Optional newer fields (may not exist in older formats)
         accelerationEvents = try container.decodeIfPresent(Int.self, forKey: .accelerationEvents) ?? 0
         phoneDistractions = try container.decodeIfPresent(Int.self, forKey: .phoneDistractions) ?? 0
-        carHornEvents = try container.decodeIfPresent(Int.self, forKey: .carHornEvents) ?? 0
+        
+        // Handle backward compatibility for hornEvents (was carHornEvents)
+        if let newHornEvents = try container.decodeIfPresent(Int.self, forKey: .hornEvents) {
+            hornEvents = newHornEvents
+        } else if let oldCarHornEvents = try container.decodeIfPresent(Int.self, forKey: .carHornEvents) {
+            hornEvents = oldCarHornEvents
+        } else {
+            hornEvents = 0
+        }
+        
         sirenEvents = try container.decodeIfPresent(Int.self, forKey: .sirenEvents) ?? 0
+    }
+    
+    // Custom encoder to use new field names
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        
+        try container.encode(brakingEventCount, forKey: .brakingEventCount)
+        try container.encode(hardBrakingEventCount, forKey: .hardBrakingEventCount)
+        try container.encode(maxSpeed, forKey: .maxSpeed)
+        try container.encode(averageSpeed, forKey: .averageSpeed)
+        try container.encode(roughRoadEvents, forKey: .roughRoadEvents)
+        try container.encode(sharpTurns, forKey: .sharpTurns)
+        try container.encode(speedViolations, forKey: .speedViolations)
+        try container.encode(totalDistance, forKey: .totalDistance)
+        try container.encode(slowTrafficTime, forKey: .slowTrafficTime)
+        try container.encode(accelerationEvents, forKey: .accelerationEvents)
+        try container.encode(phoneDistractions, forKey: .phoneDistractions)
+        try container.encode(hornEvents, forKey: .hornEvents) // Always use new key for encoding
+        try container.encode(sirenEvents, forKey: .sirenEvents)
     }
     
     // Default initializer
@@ -464,13 +500,15 @@ struct DrivingMetrics: Codable {
         let baseScore = 100
         let brakingPenalty = min(brakingEventCount * 2, 20)
         let hardBrakingPenalty = min(hardBrakingEventCount * 3, 10)
-        let roughRoadPenalty = min(roughRoadEvents * 1, 10)
+        let roughRoadPenalty = min(Int(Double(roughRoadEvents) * 0.5), 5)
         let sharpTurnPenalty = min(sharpTurns * 3, 15)
         let speedViolationPenalty = min(speedViolations * 4, 25)
         let accelerationPenalty = min(accelerationEvents * 2, 15) // 2 points per acceleration event, max 15
         let distractionPenalty = min(phoneDistractions * 3, 20) // 3 points per distraction, max 20
+        let hornPenalty = min(hornEvents * 1, 10) // 1 point per horn event, max 10
+        let slowTrafficPenalty = min(Int(slowTrafficTime / 180.0) * 2, 10) // 2 points per 3-minute block in slow traffic, max 10
         
-        return max(baseScore - brakingPenalty - hardBrakingPenalty - roughRoadPenalty - sharpTurnPenalty - speedViolationPenalty - accelerationPenalty - distractionPenalty, 0)
+        return max(baseScore - brakingPenalty - hardBrakingPenalty - roughRoadPenalty - sharpTurnPenalty - speedViolationPenalty - accelerationPenalty - distractionPenalty - hornPenalty - slowTrafficPenalty, 0)
     }
     
     var qualityDescription: String {
@@ -571,9 +609,32 @@ struct DrivingEvent: Codable, Identifiable {
         case sharpTurn = "sharpTurn"
         case roughRoad = "roughRoad"
         case phoneDistraction = "phoneDistraction"
-        case carHorn = "carHorn"
+        case horn = "horn"
         case siren = "siren"
         
+        // Custom decoder for backward compatibility
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            let stringValue = try container.decode(String.self)
+            
+            // Handle backward compatibility
+            switch stringValue {
+            case "carHorn":
+                self = .horn
+            default:
+                if let standardCase = EventType(rawValue: stringValue) {
+                    self = standardCase
+                } else {
+                    throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unknown EventType: \(stringValue)")
+                }
+            }
+        }
+        
+        // Custom encoder to always use new field names
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(self.rawValue) // Always encode using current raw value
+        }
         
         var displayName: String {
             switch self {
@@ -583,7 +644,7 @@ struct DrivingEvent: Codable, Identifiable {
             case .sharpTurn: return "Sharp Turn"
             case .roughRoad: return "Rough Road"
             case .phoneDistraction: return "Phone Use"
-            case .carHorn: return "Car Horn"
+            case .horn: return "Horn"
             case .siren: return "Siren"
             }
         }
@@ -596,7 +657,7 @@ struct DrivingEvent: Codable, Identifiable {
             case .sharpTurn: return "arrow.triangle.turn.up.right.circle"
             case .roughRoad: return "road.lanes"
             case .phoneDistraction: return "iphone"
-            case .carHorn: return "speaker.wave.3.fill"
+            case .horn: return "speaker.wave.3.fill"
             case .siren: return "music.note"
             }
         }
@@ -609,7 +670,7 @@ struct DrivingEvent: Codable, Identifiable {
             case .sharpTurn: return .systemYellow
             case .roughRoad: return .systemBrown
             case .phoneDistraction: return .systemRed
-            case .carHorn: return .systemBlue
+            case .horn: return .systemBlue
             case .siren: return .systemPurple
             }
         }
@@ -673,12 +734,14 @@ struct CommuteRecord: Codable, Identifiable {
     static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
+        formatter.locale = Locale(identifier: "en_US")
         return formatter
     }()
     
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
+        formatter.locale = Locale(identifier: "en_US")
         return formatter
     }()
     
@@ -755,6 +818,11 @@ struct AppSettings: Codable {
 
 enum ImportResult {
     case success(String)
+    case failure(String)
+}
+
+enum CSVImportResult {
+    case success(Int) // number of imported records
     case failure(String)
 }
 
@@ -986,9 +1054,9 @@ class SensorManager: ObservableObject {
         let forwardIntensity = abs(avgForwardDeceleration)
         let combinedIntensity = sqrt(pow(forwardIntensity, 2) + pow(avgLateralAcceleration, 2))
         
-        // Highly sensitive thresholds to detect even light braking
-        let isHardBraking = avgForwardDeceleration < -0.3 || combinedIntensity > 0.4
-        let isBraking = avgForwardDeceleration < -0.15 || combinedIntensity > 0.2
+        // More sensitive thresholds to detect even lighter braking
+        let isHardBraking = avgForwardDeceleration < -0.25 || combinedIntensity > 0.35
+        let isBraking = avgForwardDeceleration < -0.1 || combinedIntensity > 0.15
         
         return (isBraking, isHardBraking, combinedIntensity)
     }
@@ -1008,7 +1076,7 @@ class SensorManager: ObservableObject {
         let minValue = verticalValues.min() ?? 0
         let peakToPeak = maxValue - minValue
         
-        return variance > 0.1 || peakToPeak > 0.5 // Much more sensitive to detect even minor road imperfections
+        return variance > 0.2 || peakToPeak > 0.8 // Less sensitive to avoid false positives on minor bumps
     }
     
     func detectSharpTurn() -> Bool {
@@ -1048,7 +1116,7 @@ class SensorManager: ObservableObject {
         let avgForwardAcceleration = recentAccelerations.reduce(0) { $0 + $1.x } / Double(recentAccelerations.count)
         
         // Detect even light acceleration events (positive forward acceleration)
-        let isAccelerating = avgForwardAcceleration > 0.2 // Highly sensitive threshold for detecting acceleration
+        let isAccelerating = avgForwardAcceleration > 0.15 // More sensitive threshold for detecting acceleration
         
         if isAccelerating {
             lastAccelerationEventTime = now
@@ -1408,7 +1476,7 @@ class SoundAnalysisManager: NSObject, ObservableObject {
                 self.isListening = true
             }
             
-            print("🔊 Started sound analysis for car horns and sirens")
+            print("🔊 Started sound analysis for horns and sirens")
             
         } catch {
             print("❌ Failed to start audio engine: \(error)")
@@ -1504,8 +1572,25 @@ extension SoundAnalysisManager: SNResultsObserving {
                 print("🔊 Sound detected: '\(identifier)' with confidence: \(confidence)")
             }
             
-            // Look for car horn sounds with increased sensitivity
-            if confidence > 0.3 { // Lowered from 0.7 to 0.3 for higher sensitivity
+            // Look for siren sounds with high sensitivity
+            if confidence > 0.2 && (identifier.contains("siren") || identifier.contains("emergency")) {
+                // Apply rate limiting for siren detection
+                let now = Date()
+                if let lastDetection = self.lastSirenDetectionTime,
+                   now.timeIntervalSince(lastDetection) < self.sirenDetectionCooldown {
+                    print("🚨 Siren detected but within cooldown period (ignoring)")
+                    return
+                }
+                
+                self.lastSirenDetectionTime = now
+                DispatchQueue.main.async {
+                    self.lastDetectedSound = "Siren"
+                    self.onSirenDetected?()
+                }
+                print("🚨 Siren detected with confidence: \(confidence)")
+            }
+            // Look for horn sounds with moderate sensitivity
+            else if confidence > 0.35 { // Slightly higher threshold to reduce false positives
                 if identifier.contains("horn") || 
                    identifier.contains("car horn") ||
                    identifier.contains("vehicle horn") ||
@@ -1526,7 +1611,7 @@ extension SoundAnalysisManager: SNResultsObserving {
                     
                     self.lastHornDetectionTime = now
                     DispatchQueue.main.async {
-                        self.lastDetectedSound = "Car Horn"
+                        self.lastDetectedSound = "Horn"
                         self.onCarHornDetected?()
                     }
                     print("🚗 Car horn detected with confidence: \(confidence)")
@@ -1553,26 +1638,10 @@ extension SoundAnalysisManager: SNResultsObserving {
                     
                     self.lastHornDetectionTime = now
                     DispatchQueue.main.async {
-                        self.lastDetectedSound = "Possible Car Horn"
+                        self.lastDetectedSound = "Possible Horn"
                         self.onCarHornDetected?()
                     }
-                    print("🚗 Possible car horn detected with confidence: \(confidence)")
-                }
-                else if identifier.contains("siren") || identifier.contains("emergency") {
-                    // Apply rate limiting for siren detection
-                    let now = Date()
-                    if let lastDetection = self.lastSirenDetectionTime,
-                       now.timeIntervalSince(lastDetection) < self.sirenDetectionCooldown {
-                        print("🚨 Siren detected but within cooldown period (ignoring)")
-                        return
-                    }
-                    
-                    self.lastSirenDetectionTime = now
-                    DispatchQueue.main.async {
-                        self.lastDetectedSound = "Siren"
-                        self.onSirenDetected?()
-                    }
-                    print("🚨 Siren detected with confidence: \(confidence)")
+                    print("🚗 Possible horn detected with confidence: \(confidence)")
                 }
             }
         }
@@ -2000,8 +2069,8 @@ class CommuteTracker: ObservableObject {
         
         // Update metrics counters
         switch event.type {
-        case .carHorn:
-            currentMetrics.carHornEvents += 1
+        case .horn:
+            currentMetrics.hornEvents += 1
         case .siren:
             currentMetrics.sirenEvents += 1
         default:
@@ -2176,11 +2245,12 @@ class CommuteTracker: ObservableObject {
     }
     
     func exportToCSV() -> String {
-        var csvContent = "Date,Type,Start Time,End Time,Duration (minutes),Driving Score,Quality,Braking Events,Hard Braking,Max Speed (km/h),Average Speed (km/h),Distance (m),Rough Road Events,Sharp Turns,Speed Violations,Acceleration Events,Phone Distractions,Car Horn Events,Siren Events,Slow Traffic Time (min),Slow Traffic %,Start Latitude,Start Longitude,End Latitude,End Longitude,Path Points Count,Heavy Traffic Periods,Total Heavy Traffic Duration (min)\n"
+        var csvContent = "Date,Type,Start Time,End Time,Duration (minutes),Driving Score,Quality,Braking Events,Hard Braking,Max Speed (km/h),Average Speed (km/h),Distance (m),Rough Road Events,Sharp Turns,Speed Violations,Acceleration Events,Phone Distractions,Horn Events,Siren Events,Slow Traffic Time (min),Slow Traffic %,Start Latitude,Start Longitude,End Latitude,End Longitude,Path Points Count,Heavy Traffic Periods,Total Heavy Traffic Duration (min)\n"
         
         // Use shared formatters from CommuteRecord
         for commute in commutes.reversed() {
             let date = commute.formattedDate
+            print("🗓️ Commute startTime: \(commute.startTime), formatted: \(date)")
             let type = commute.type.displayName
             let startTime = commute.formattedStartTime
             let endTime = CommuteRecord.timeFormatter.string(from: commute.endTime)
@@ -2197,10 +2267,231 @@ class CommuteTracker: ObservableObject {
             let slowTrafficTimeMin = metrics.slowTrafficTime / 60.0
             let slowTrafficPercentage = commute.duration > 0 ? (metrics.slowTrafficTime / commute.duration) * 100 : 0
             
-            csvContent += "\(date),\(type),\(startTime),\(endTime),\(duration),\(metrics.drivingScore),\(metrics.qualityDescription),\(metrics.brakingEventCount),\(metrics.hardBrakingEventCount),\(String(format: "%.1f", metrics.maxSpeed)),\(String(format: "%.1f", metrics.averageSpeed)),\(String(format: "%.0f", commute.totalDistance)),\(metrics.roughRoadEvents),\(metrics.sharpTurns),\(metrics.speedViolations),\(metrics.accelerationEvents),\(metrics.phoneDistractions),\(metrics.carHornEvents),\(metrics.sirenEvents),\(String(format: "%.1f", slowTrafficTimeMin)),\(String(format: "%.1f", slowTrafficPercentage)),\(startLat),\(startLng),\(endLat),\(endLng),\(pathCount),\(heavyTrafficCount),\(String(format: "%.1f", totalHeavyTrafficDuration))\n"
+            csvContent += "\(date),\(type),\(startTime),\(endTime),\(duration),\(metrics.drivingScore),\(metrics.qualityDescription),\(metrics.brakingEventCount),\(metrics.hardBrakingEventCount),\(String(format: "%.1f", metrics.maxSpeed)),\(String(format: "%.1f", metrics.averageSpeed)),\(String(format: "%.0f", commute.totalDistance)),\(metrics.roughRoadEvents),\(metrics.sharpTurns),\(metrics.speedViolations),\(metrics.accelerationEvents),\(metrics.phoneDistractions),\(metrics.hornEvents),\(metrics.sirenEvents),\(String(format: "%.1f", slowTrafficTimeMin)),\(String(format: "%.1f", slowTrafficPercentage)),\(startLat),\(startLng),\(endLat),\(endLng),\(pathCount),\(heavyTrafficCount),\(String(format: "%.1f", totalHeavyTrafficDuration))\n"
         }
         
         return csvContent
+    }
+    
+    func importFromCSV(_ csvContent: String) throws -> Int {
+        print("📊 Starting CSV import...")
+        print("📊 CSV content length: \(csvContent.count) characters")
+        
+        let lines = csvContent.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        print("📊 Found \(lines.count) non-empty lines")
+        
+        guard lines.count > 1 else {
+            throw ImportError.invalidFormat("CSV file is empty or contains only header")
+        }
+        
+        let header = lines[0]
+        let dataLines = Array(lines[1...])
+        
+        print("📊 Header: \(header)")
+        print("📊 Data lines: \(dataLines.count)")
+        
+        // Detect format based on header
+        let isOldFormat = header.contains("Car Horn Events")
+        let expectedColumns = isOldFormat ? 27 : 27 // Same number of columns, just different names
+        
+        print("📊 Detected format: \(isOldFormat ? "Old" : "New")")
+        
+        var importedCount = 0
+        var skippedCount = 0
+        var errorCount = 0
+        
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "MMM dd, yyyy"  // Handle "Aug 22, 2025" format
+        
+        let timeFormatter = DateFormatter()
+        timeFormatter.dateFormat = "HH:mm"
+        
+        for (index, line) in dataLines.enumerated() {
+            do {
+                print("📊 Processing line \(index + 2): \(line.prefix(100))...")
+                let columns = parseCSVLine(line)
+                print("📊 Parsed \(columns.count) columns: \(columns.prefix(5))")
+                
+                guard columns.count >= expectedColumns else {
+                    print("⚠️ Skipping line \(index + 2): insufficient columns (\(columns.count)/\(expectedColumns))")
+                    skippedCount += 1
+                    continue
+                }
+                
+                // Parse date and times
+                print("📊 Parsing date: '\(columns[0])' startTime: '\(columns[2])' endTime: '\(columns[3])'")
+                guard let date = dateFormatter.date(from: columns[0]),
+                      let startTime = parseTimeWithDate(columns[2], date: date),
+                      let endTime = parseTimeWithDate(columns[3], date: date) else {
+                    print("⚠️ Skipping line \(index + 2): invalid date/time format")
+                    skippedCount += 1
+                    continue
+                }
+                
+                // Parse commute type
+                let typeString = columns[1]
+                let commuteType = CommuteType(id: typeString.lowercased().replacingOccurrences(of: " ", with: "-"), displayName: typeString, isDefault: false)
+                
+                // Parse metrics with backward compatibility
+                let metrics = try parseMetricsFromCSV(columns: columns, isOldFormat: isOldFormat)
+                
+                // Create commute record using custom initializer
+                let commute = CommuteRecord(
+                    type: commuteType,
+                    startTime: startTime,
+                    endTime: endTime,
+                    duration: endTime.timeIntervalSince(startTime),
+                    drivingMetrics: metrics,
+                    startLocation: parseLocation(lat: columns[20], lng: columns[21]),
+                    endLocation: parseLocation(lat: columns[22], lng: columns[23]),
+                    pathPoints: [], // CSV doesn't contain full path data
+                    totalDistance: Double(columns[11]) ?? 0.0,
+                    heavyTrafficPeriods: [], // CSV doesn't contain detailed traffic data
+                    drivingEvents: [] // CSV doesn't contain event details
+                )
+                
+                // Add to commutes if not duplicate
+                if !isDuplicateCommute(commute) {
+                    commutes.append(commute)
+                    importedCount += 1
+                    print("✅ Successfully imported record \(importedCount)")
+                } else {
+                    print("⚠️ Skipping duplicate commute")
+                    skippedCount += 1
+                }
+                
+            } catch {
+                print("❌ Error parsing line \(index + 2): \(error)")
+                errorCount += 1
+                continue
+            }
+        }
+        
+        print("📊 Import summary: \(importedCount) imported, \(skippedCount) skipped, \(errorCount) errors")
+        
+        // Sort by start time
+        commutes.sort { $0.startTime < $1.startTime }
+        
+        // Save to disk
+        saveCommutes()
+        
+        return importedCount
+    }
+    
+    private func parseCSVLine(_ line: String) -> [String] {
+        // Special handling for our date format "Aug 22, 2025" which contains commas
+        // Use regex to handle the date pattern properly
+        
+        let datePattern = #"^(\w+\s+\d+,\s+\d+),"#
+        let regex = try? NSRegularExpression(pattern: datePattern)
+        
+        var processedLine = line
+        if let match = regex?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
+            let dateRange = Range(match.range(at: 1), in: line)!
+            let datePart = String(line[dateRange])
+            // Replace commas in the date with a placeholder
+            let quotedDate = "\"\(datePart)\""
+            processedLine = line.replacingCharacters(in: dateRange, with: quotedDate)
+        }
+        
+        // Now parse the CSV normally
+        var fields: [String] = []
+        var currentField = ""
+        var insideQuotes = false
+        
+        for char in processedLine {
+            if char == "\"" {
+                insideQuotes.toggle()
+            } else if char == "," && !insideQuotes {
+                fields.append(currentField.trimmingCharacters(in: .whitespacesAndNewlines))
+                currentField = ""
+            } else {
+                currentField.append(char)
+            }
+        }
+        
+        // Add the last field
+        fields.append(currentField.trimmingCharacters(in: .whitespacesAndNewlines))
+        
+        // Debug: print first few fields to see parsing
+        print("🔍 Parsed fields: \(fields.prefix(6).map { "\"\($0)\"" })")
+        
+        return fields
+    }
+    
+    private func parseTimeWithDate(_ timeString: String, date: Date) -> Date? {
+        let timeFormatter = DateFormatter()
+        timeFormatter.dateFormat = "HH:mm"
+        
+        guard let time = timeFormatter.date(from: timeString) else { return nil }
+        
+        let calendar = Calendar.current
+        let timeComponents = calendar.dateComponents([.hour, .minute], from: time)
+        let dateComponents = calendar.dateComponents([.year, .month, .day], from: date)
+        
+        var combinedComponents = DateComponents()
+        combinedComponents.year = dateComponents.year
+        combinedComponents.month = dateComponents.month
+        combinedComponents.day = dateComponents.day
+        combinedComponents.hour = timeComponents.hour
+        combinedComponents.minute = timeComponents.minute
+        
+        return calendar.date(from: combinedComponents)
+    }
+    
+    private func parseLocation(lat: String, lng: String) -> LocationPoint? {
+        guard let latitude = Double(lat), let longitude = Double(lng) else { return nil }
+        return LocationPoint(latitude: latitude, longitude: longitude, timestamp: Date(), speed: 0.0, accuracy: 0.0)
+    }
+    
+    private func parseMetricsFromCSV(columns: [String], isOldFormat: Bool) throws -> DrivingMetrics {
+        var metrics = DrivingMetrics()
+        
+        // Parse common fields (same in both formats)
+        metrics.brakingEventCount = Int(columns[7]) ?? 0
+        metrics.hardBrakingEventCount = Int(columns[8]) ?? 0
+        metrics.maxSpeed = Double(columns[9]) ?? 0.0
+        metrics.averageSpeed = Double(columns[10]) ?? 0.0
+        metrics.roughRoadEvents = Int(columns[12]) ?? 0
+        metrics.sharpTurns = Int(columns[13]) ?? 0
+        metrics.speedViolations = Int(columns[14]) ?? 0
+        metrics.accelerationEvents = Int(columns[15]) ?? 0
+        metrics.phoneDistractions = Int(columns[16]) ?? 0
+        metrics.sirenEvents = Int(columns[18]) ?? 0
+        metrics.slowTrafficTime = (Double(columns[19]) ?? 0.0) * 60.0 // Convert minutes to seconds
+        
+        // Handle horn events with backward compatibility
+        if isOldFormat {
+            // Old format: "Car Horn Events" at column 17
+            metrics.hornEvents = Int(columns[17]) ?? 0
+        } else {
+            // New format: "Horn Events" at column 17
+            metrics.hornEvents = Int(columns[17]) ?? 0
+        }
+        
+        return metrics
+    }
+    
+    private func isDuplicateCommute(_ newCommute: CommuteRecord) -> Bool {
+        return commutes.contains { existingCommute in
+            existingCommute.type == newCommute.type &&
+            abs(existingCommute.startTime.timeIntervalSince(newCommute.startTime)) < 60 && // Within 1 minute
+            abs(existingCommute.duration - newCommute.duration) < 60 // Duration within 1 minute
+        }
+    }
+    
+    enum ImportError: LocalizedError {
+        case invalidFormat(String)
+        case parseError(String)
+        
+        var errorDescription: String? {
+            switch self {
+            case .invalidFormat(let message):
+                return "Invalid CSV format: \(message)"
+            case .parseError(let message):
+                return "Parse error: \(message)"
+            }
+        }
     }
     
     func exportDetailedGPSData() -> String {
@@ -2683,7 +2974,10 @@ struct ContentView: View {
     @State private var showSplashScreen = true
     @State private var showOnboarding = false
     @State private var showDocumentPicker = false
+    @State private var showCSVImporter = false
+    @State private var isImportingCSV = false
     @State private var importResult: ImportResult?
+    @State private var csvImportResult: CSVImportResult?
     @State private var fullScreenMapCommute: CommuteRecord?
     @State private var showDrivingEvents = true
     @State private var visibleEventTypes: Set<DrivingEvent.EventType> = Set(DrivingEvent.EventType.allCases)
@@ -2797,6 +3091,74 @@ struct ContentView: View {
             case .failure(let error):
                 print("❌ File selection error: \(error.localizedDescription)")
                 importResult = .failure("Failed to select file: \(error.localizedDescription)")
+            }
+        }
+        .fileImporter(
+            isPresented: $showCSVImporter,
+            allowedContentTypes: [.plainText, .text],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                
+                // Start accessing security-scoped resource
+                let hasAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if hasAccess {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                
+                do {
+                    print("📁 Attempting to import CSV from: \(url.path)")
+                    print("🔐 Security-scoped access: \(hasAccess)")
+                    print("📂 File exists: \(FileManager.default.fileExists(atPath: url.path))")
+                    print("📂 File readable: \(FileManager.default.isReadableFile(atPath: url.path))")
+                    
+                    // Try different encodings if UTF-8 fails
+                    var csvContent: String
+                    if let utf8Content = try? String(contentsOf: url, encoding: .utf8) {
+                        csvContent = utf8Content
+                    } else if let asciiContent = try? String(contentsOf: url, encoding: .ascii) {
+                        csvContent = asciiContent
+                        print("⚠️ Using ASCII encoding instead of UTF-8")
+                    } else {
+                        throw NSError(domain: "CSVImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not read file with UTF-8 or ASCII encoding"])
+                    }
+                    
+                    print("📊 CSV content length: \(csvContent.count) characters")
+                    
+                    let importedCount = try commuteTracker.importFromCSV(csvContent)
+                    
+                    DispatchQueue.main.async {
+                        csvImportResult = .success(importedCount)
+                    }
+                    
+                } catch {
+                    print("❌ CSV import error: \(error.localizedDescription)")
+                    DispatchQueue.main.async {
+                        csvImportResult = .failure("Failed to import CSV: \(error.localizedDescription)")
+                    }
+                }
+                
+            case .failure(let error):
+                print("❌ CSV file selection error: \(error.localizedDescription)")
+                csvImportResult = .failure("Failed to select CSV file: \(error.localizedDescription)")
+            }
+        }
+        .alert("CSV Import Result", isPresented: .constant(csvImportResult != nil)) {
+            Button("OK") {
+                csvImportResult = nil
+            }
+        } message: {
+            if let result = csvImportResult {
+                switch result {
+                case .success(let count):
+                    Text("Successfully imported \(count) commute record\(count == 1 ? "" : "s")")
+                case .failure(let error):
+                    Text(error)
+                }
             }
         }
         .alert("Import Result", isPresented: .constant(importResult != nil)) {
@@ -3097,7 +3459,7 @@ struct ContentView: View {
                     MetricTile(title: "Sharp Turns", value: "\(commuteTracker.currentMetrics.sharpTurns)", color: DesignSystem.Colors.warning)
                     MetricTile(title: "Accelerations", value: "\(commuteTracker.currentMetrics.accelerationEvents)", color: DesignSystem.Colors.accent)
                     MetricTile(title: "Phone Use", value: "\(commuteTracker.currentMetrics.phoneDistractions)", color: DesignSystem.Colors.error)
-                    MetricTile(title: "Car Horns", value: "\(commuteTracker.currentMetrics.carHornEvents)", color: DesignSystem.Colors.primary)
+                    MetricTile(title: "Horns", value: "\(commuteTracker.currentMetrics.hornEvents)", color: DesignSystem.Colors.primary)
                     MetricTile(title: "Sirens", value: "\(commuteTracker.currentMetrics.sirenEvents)", color: DesignSystem.Colors.accent)
                     MetricTile(title: "Rough Roads", value: "\(commuteTracker.currentMetrics.roughRoadEvents)", color: DesignSystem.Colors.speedSlow)
                     MetricTile(title: "Speed Violations", value: "\(commuteTracker.currentMetrics.speedViolations)", color: DesignSystem.Colors.speedVeryFast)
@@ -3304,7 +3666,7 @@ struct ContentView: View {
             setupSoundEventCallbacks()
             print("✅ Sound analysis started")
         } else {
-            print("⚠️ Microphone disabled by user - car horn and siren detection will not be recorded")
+            print("⚠️ Microphone disabled by user - horn and siren detection will not be recorded")
         }
         
         // Keep screen on during active trip
@@ -3326,9 +3688,9 @@ struct ContentView: View {
         soundAnalysisManager.onCarHornDetected = {
             guard let location = locationManager.currentLocation else { return }
             
-            // Add car horn event to active commute
+            // Add horn event to active commute
             let event = DrivingEvent(
-                type: .carHorn,
+                type: .horn,
                 location: location,
                 intensity: 1.0,
                 timestamp: Date()
@@ -3614,7 +3976,7 @@ struct ContentView: View {
                 CompactMetric(icon: "iphone", value: "\(metrics.phoneDistractions)", color: DesignSystem.Colors.error, title: "Phone")
                 CompactMetric(icon: "road.lanes", value: "\(metrics.roughRoadEvents)", color: DesignSystem.Colors.speedSlow, title: "Rough")
                 CompactMetric(icon: "speedometer", value: "\(metrics.speedViolations)", color: DesignSystem.Colors.speedVeryFast, title: "Speed")
-                CompactMetric(icon: "speaker.wave.3.fill", value: "\(metrics.carHornEvents)", color: DesignSystem.Colors.primary, title: "Horns")
+                CompactMetric(icon: "speaker.wave.3.fill", value: "\(metrics.hornEvents)", color: DesignSystem.Colors.primary, title: "Horns")
                 CompactMetric(icon: "music.note", value: "\(metrics.sirenEvents)", color: DesignSystem.Colors.accent, title: "Sirens")
             }
             
@@ -3727,7 +4089,7 @@ struct ContentView: View {
                                 
                                 OverallStats(filteredCommutes: safeFilteredCommutes)
                                 TrafficAnalysisInsights(filteredCommutes: safeFilteredCommutes)
-                                DrivingQualityInsights(filteredCommutes: safeFilteredCommutes)
+                                DriveQualityInsights(filteredCommutes: safeFilteredCommutes)
                                 WeeklyInsights(filteredCommutes: safeFilteredCommutes)
                             }
                         }
@@ -3888,7 +4250,7 @@ struct ContentView: View {
         var totalBrakingEvents: Int = 0
         var totalAccelerationEvents: Int = 0
         var totalPhoneDistractions: Int = 0
-        var totalCarHorns: Int = 0
+        var totalHorns: Int = 0
         var totalSirens: Int = 0
         var totalSlowTrafficTime: TimeInterval = 0
         
@@ -3907,7 +4269,7 @@ struct ContentView: View {
             totalBrakingEvents += max(0, commute.drivingMetrics.brakingEventCount)
             totalAccelerationEvents += max(0, commute.drivingMetrics.accelerationEvents)
             totalPhoneDistractions += max(0, commute.drivingMetrics.phoneDistractions)
-            totalCarHorns += max(0, commute.drivingMetrics.carHornEvents)
+            totalHorns += max(0, commute.drivingMetrics.hornEvents)
             totalSirens += max(0, commute.drivingMetrics.sirenEvents)
             
             let slowTraffic = commute.drivingMetrics.slowTrafficTime
@@ -3923,7 +4285,7 @@ struct ContentView: View {
         let averageBrakingEvents = count > 0 ? Double(totalBrakingEvents) / count : 0
         let averageAccelerationEvents = count > 0 ? Double(totalAccelerationEvents) / count : 0
         let averagePhoneDistractions = count > 0 ? Double(totalPhoneDistractions) / count : 0
-        let averageCarHorns = count > 0 ? Double(totalCarHorns) / count : 0
+        let averageHorns = count > 0 ? Double(totalHorns) / count : 0
         let averageSirens = count > 0 ? Double(totalSirens) / count : 0
         let averageSlowTrafficTime = count > 0 ? totalSlowTrafficTime / count / 60.0 : 0
         
@@ -3954,7 +4316,7 @@ struct ContentView: View {
                     StatCard(title: "Avg Slow Traffic", value: "\(Int(averageSlowTrafficTime))m", color: DesignSystem.Colors.warning, icon: "tortoise.fill")
                 }
                 
-                if averageBrakingEvents > 0 || averageSlowTrafficTime > 0 || averageAccelerationEvents > 0 || averagePhoneDistractions > 0 || averageCarHorns > 0 || averageSirens > 0 {
+                if averageBrakingEvents > 0 || averageSlowTrafficTime > 0 || averageAccelerationEvents > 0 || averagePhoneDistractions > 0 || averageHorns > 0 || averageSirens > 0 {
                     Divider()
                         .background(DesignSystem.Colors.borderColor)
                     
@@ -3962,7 +4324,7 @@ struct ContentView: View {
                         StatCard(title: "Avg Braking", value: String(format: "%.1f", averageBrakingEvents), color: DesignSystem.Colors.error, icon: "exclamationmark.triangle.fill")
                         StatCard(title: "Avg Accelerations", value: String(format: "%.1f", averageAccelerationEvents), color: DesignSystem.Colors.accent, icon: "forward.fill")
                         StatCard(title: "Avg Phone Use", value: String(format: "%.1f", averagePhoneDistractions), color: DesignSystem.Colors.error, icon: "iphone")
-                        StatCard(title: "Avg Car Horns", value: String(format: "%.1f", averageCarHorns), color: DesignSystem.Colors.primary, icon: "speaker.wave.3.fill")
+                        StatCard(title: "Avg Horns", value: String(format: "%.1f", averageHorns), color: DesignSystem.Colors.primary, icon: "speaker.wave.3.fill")
                         StatCard(title: "Avg Sirens", value: String(format: "%.1f", averageSirens), color: DesignSystem.Colors.accent, icon: "music.note")
                     }
                 }
@@ -4037,12 +4399,12 @@ struct ContentView: View {
         .shadow(radius: 2)
     }
     
-    func DrivingQualityInsights(filteredCommutes: [CommuteRecord]) -> some View {
+    func DriveQualityInsights(filteredCommutes: [CommuteRecord]) -> some View {
         let bestCommute = filteredCommutes.max { $0.drivingMetrics.drivingScore < $1.drivingMetrics.drivingScore }
         let worstCommute = filteredCommutes.min { $0.drivingMetrics.drivingScore < $1.drivingMetrics.drivingScore }
         
         return VStack(alignment: .leading, spacing: 16) {
-            Text("Driving Quality Insights")
+            Text("Drive Quality Insights")
                 .font(.title2)
                 .fontWeight(.bold)
             
@@ -4677,7 +5039,7 @@ struct ContentView: View {
                                 
                                 SettingToggle(
                                     title: "Microphone",
-                                    description: "Detect car horns and sirens for safety analysis",
+                                    description: "Detect horns and sirens for safety analysis",
                                     isOn: $settingsManager.enableMicrophone,
                                     action: { newValue in
                                         settingsManager.saveMicrophoneSetting(newValue)
@@ -4771,9 +5133,19 @@ struct ContentView: View {
                                         )
                                     }
                                     
-                                    AnimatedButton(action: {
-                                        showDocumentPicker = true
-                                    }) {
+                                    Menu {
+                                        Button(action: {
+                                            showDocumentPicker = true
+                                        }) {
+                                            Label("Import Backup (JSON)", systemImage: "doc.text")
+                                        }
+                                        
+                                        Button(action: {
+                                            showCSVImporter = true
+                                        }) {
+                                            Label("Import CSV Data", systemImage: "tablecells")
+                                        }
+                                    } label: {
                                         HStack {
                                             Image(systemName: "square.and.arrow.down")
                                                 .font(.caption)
@@ -5183,13 +5555,21 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Share Button
+    // MARK: - Import/Export Buttons
     func ShareButton() -> some View {
         Menu {
             ShareLink("Export Summary", item: createCSVFile())
             ShareLink("Export GPS Data", item: createDetailedGPSFile())
+            
+            Divider()
+            
+            Button {
+                showCSVImporter = true
+            } label: {
+                Label("Import CSV", systemImage: "square.and.arrow.down")
+            }
         } label: {
-            Text("Export")
+            Text("Data")
         }
     }
     
