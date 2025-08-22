@@ -764,33 +764,54 @@ class TripManager: ObservableObject {
     
     private let userDefaults = UserDefaults.standard
     private let tripsKey = "CustomTrips"
+    private let firstLaunchKey = "HasLaunchedBefore"
     
     init() {
         loadTrips()
     }
     
     private func loadTrips() {
-        availableTrips = [CommuteType.homeToOffice, CommuteType.officeToHome]
+        let hasLaunchedBefore = userDefaults.bool(forKey: firstLaunchKey)
         
-        if let data = userDefaults.data(forKey: tripsKey),
-           let customTrips = try? JSONDecoder().decode([CommuteType].self, from: data) {
-            availableTrips.append(contentsOf: customTrips)
-            print("✅ Loaded \(customTrips.count) custom trips")
+        if !hasLaunchedBefore {
+            // First launch - use default trips
+            availableTrips = [CommuteType.homeToOffice, CommuteType.officeToHome]
+            
+            // Mark as launched and save defaults as user trips for future use
+            userDefaults.set(true, forKey: firstLaunchKey)
+            saveTripsAsCustom()
+            print("ℹ️ First launch - initialized with default trips")
         } else {
-            print("ℹ️ No custom trips found")
+            // Load saved trips from previous sessions
+            if let data = userDefaults.data(forKey: tripsKey),
+               let savedTrips = try? JSONDecoder().decode([CommuteType].self, from: data) {
+                availableTrips = savedTrips
+                print("✅ Loaded \(savedTrips.count) saved trips")
+            } else {
+                // Fallback if no saved trips found
+                availableTrips = [CommuteType.homeToOffice, CommuteType.officeToHome]
+                print("⚠️ No saved trips found, using defaults")
+            }
         }
     }
     
     func saveTrips() {
-        let customTrips = availableTrips.filter { !$0.isDefault }
         do {
-            let data = try JSONEncoder().encode(customTrips)
+            let data = try JSONEncoder().encode(availableTrips)
             userDefaults.set(data, forKey: tripsKey)
             userDefaults.synchronize()  // Enable iCloud sync
-            print("✅ Saved \(customTrips.count) custom trips")
+            print("✅ Saved \(availableTrips.count) trips")
         } catch {
             print("❌ Failed to save trips: \(error.localizedDescription)")
         }
+    }
+    
+    private func saveTripsAsCustom() {
+        // Convert default trips to custom trips so they can be edited
+        availableTrips = availableTrips.map { trip in
+            CommuteType(id: trip.id, displayName: trip.displayName, isDefault: false)
+        }
+        saveTrips()
     }
     
     func addTrip(name: String) {
@@ -803,11 +824,8 @@ class TripManager: ObservableObject {
     func updateTrip(tripId: String, newName: String) {
         if let index = availableTrips.firstIndex(where: { $0.id == tripId }) {
             let trip = availableTrips[index]
-            if trip.isDefault {
-                availableTrips[index] = CommuteType(id: trip.id, displayName: newName, isDefault: true)
-            } else {
-                availableTrips[index] = CommuteType(id: trip.id, displayName: newName, isDefault: false)
-            }
+            // All trips are now treated as custom after first launch
+            availableTrips[index] = CommuteType(id: trip.id, displayName: newName, isDefault: false)
             saveTrips()
         }
     }
@@ -3432,15 +3450,6 @@ struct ContentView: View {
             .navigationTitle("History")
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    if !commuteTracker.commutes.isEmpty {
-                        Button("Edit") {
-                            // Handle edit mode
-                        }
-                        .font(DesignSystem.Typography.body)
-                        .foregroundColor(DesignSystem.Colors.primary)
-                    }
-                }
                 
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if !commuteTracker.commutes.isEmpty {
@@ -4059,7 +4068,7 @@ struct ContentView: View {
             
             DrivingTrendsChart(filteredCommutes: filteredCommutes)
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(DesignSystem.Spacing.md)
         .background(DesignSystem.Colors.cardBackground)
         .cornerRadius(DesignSystem.CornerRadius.md)
@@ -4211,6 +4220,7 @@ struct ContentView: View {
                             .frame(width: 20, height: height)
                             .cornerRadius(2)
                     }
+                    Spacer()
                 }
                 .frame(height: 50)
                 
@@ -5970,7 +5980,7 @@ struct AddTripSheet: View {
 struct OnboardingView: View {
     let onComplete: () -> Void
     @State private var currentPage = 0
-    private let pages = 3
+    private let pages = 4
     
     var body: some View {
         ZStack {
@@ -6027,8 +6037,17 @@ struct OnboardingView: View {
                         description: "For each day of the week, Time To Go analyzes your travel data to recommend the optimal 10-minute window to leave for the fastest, most reliable trip."
                     )
                     .tag(2)
+                    
+                    // Page 4: Insights & Analytics
+                    OnboardingPageView(
+                        icon: "chart.bar.fill",
+                        title: "Comprehensive Insights",
+                        subtitle: "Driving insights and traffic analytics",
+                        description: "Get detailed driving insights including speed analysis, harsh braking detection, and comprehensive traffic insights to understand road conditions and optimize your routes."
+                    )
+                    .tag(3)
                 }
-                .tabViewStyle(PageTabViewStyle(indexDisplayMode: .always))
+                .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
                 .frame(height: 500)
                 
                 Spacer()
