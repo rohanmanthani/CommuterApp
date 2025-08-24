@@ -345,6 +345,29 @@ struct SettingToggle: View {
     }
 }
 
+// MARK: - Sensitivity Levels
+enum SensitivityLevel: String, CaseIterable {
+    case low = "low"
+    case medium = "medium"
+    case high = "high"
+    
+    var displayName: String {
+        switch self {
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        }
+    }
+    
+    var description: String {
+        switch self {
+        case .low: return "Less sensitive - only detects significant events"
+        case .medium: return "Balanced detection for typical driving conditions"
+        case .high: return "More sensitive - detects subtle changes and events"
+        }
+    }
+}
+
 // MARK: - Settings Manager
 class SettingsManager: ObservableObject {
     @Published var speedLimitThreshold: Double = 80.0 // km/h
@@ -357,6 +380,15 @@ class SettingsManager: ObservableObject {
     @Published var enableMotionSensors: Bool = true // Enable accelerometer/gyroscope
     @Published var enableMicrophone: Bool = true // Enable sound analysis for horns/sirens
     
+    // Individual event sensitivity settings
+    @Published var brakingSensitivity: SensitivityLevel = .medium
+    @Published var hardBrakingSensitivity: SensitivityLevel = .medium
+    @Published var accelerationSensitivity: SensitivityLevel = .medium
+    @Published var sharpTurnSensitivity: SensitivityLevel = .low
+    @Published var roughRoadSensitivity: SensitivityLevel = .medium
+    @Published var hornSensitivity: SensitivityLevel = .medium
+    @Published var sirenSensitivity: SensitivityLevel = .medium
+    
     private let userDefaults = UserDefaults.standard
     private let speedLimitKey = "SpeedLimitThreshold"
     private let keepScreenOnKey = "KeepScreenOn"
@@ -366,22 +398,35 @@ class SettingsManager: ObservableObject {
     private let enableMotionSensorsKey = "EnableMotionSensors"
     private let enableMicrophoneKey = "EnableMicrophone"
     
+    // Sensitivity settings keys
+    private let brakingSensitivityKey = "BrakingSensitivity"
+    private let hardBrakingSensitivityKey = "HardBrakingSensitivity"
+    private let accelerationSensitivityKey = "AccelerationSensitivity"
+    private let sharpTurnSensitivityKey = "SharpTurnSensitivity"
+    private let roughRoadSensitivityKey = "RoughRoadSensitivity"
+    private let hornSensitivityKey = "HornSensitivity"
+    private let sirenSensitivityKey = "SirenSensitivity"
+    
     init() {
         loadSettings()
     }
     
     private func loadSettings() {
         let savedSpeedLimit = userDefaults.double(forKey: speedLimitKey)
-        if savedSpeedLimit > 0 {
-            speedLimitThreshold = savedSpeedLimit
+        if savedSpeedLimit > 0 && savedSpeedLimit.isFinite {
+            speedLimitThreshold = max(30, min(150, savedSpeedLimit))
+        } else {
+            speedLimitThreshold = 80.0 // Ensure default value
         }
         
         keepScreenOn = userDefaults.object(forKey: keepScreenOnKey) as? Bool ?? true
         useLocationBasedOrdering = userDefaults.object(forKey: locationOrderingKey) as? Bool ?? true
         
         let savedAutoEndTime = userDefaults.double(forKey: autoEndTimeKey)
-        if savedAutoEndTime > 0 {
-            autoEndTimeHours = savedAutoEndTime
+        if savedAutoEndTime > 0 && savedAutoEndTime.isFinite {
+            autoEndTimeHours = max(1.0, min(12.0, savedAutoEndTime))
+        } else {
+            autoEndTimeHours = 4.0 // Ensure default value
         }
         
         // Load sensor preferences (default to enabled)
@@ -389,6 +434,23 @@ class SettingsManager: ObservableObject {
         enableMotionSensors = userDefaults.object(forKey: enableMotionSensorsKey) as? Bool ?? true
         enableMicrophone = userDefaults.object(forKey: enableMicrophoneKey) as? Bool ?? true
         
+        // Load sensitivity settings (default to medium) - optimized loading
+        loadSensitivitySetting(&brakingSensitivity, key: brakingSensitivityKey)
+        loadSensitivitySetting(&hardBrakingSensitivity, key: hardBrakingSensitivityKey)
+        loadSensitivitySetting(&accelerationSensitivity, key: accelerationSensitivityKey)
+        loadSensitivitySetting(&sharpTurnSensitivity, key: sharpTurnSensitivityKey)
+        loadSensitivitySetting(&roughRoadSensitivity, key: roughRoadSensitivityKey)
+        loadSensitivitySetting(&hornSensitivity, key: hornSensitivityKey)
+        loadSensitivitySetting(&sirenSensitivity, key: sirenSensitivityKey)
+    }
+    
+    private func loadSensitivitySetting(_ setting: inout SensitivityLevel, key: String) {
+        if let rawValue = userDefaults.string(forKey: key),
+           let level = SensitivityLevel(rawValue: rawValue) {
+            setting = level
+        } else {
+            setting = .medium
+        }
     }
     
     func saveSpeedLimit(_ limit: Double) {
@@ -433,6 +495,52 @@ class SettingsManager: ObservableObject {
         enableMicrophone = enabled
         userDefaults.set(enabled, forKey: enableMicrophoneKey)
         userDefaults.synchronize()
+    }
+    
+    // MARK: - Sensitivity Settings
+    func saveSensitivity(for eventType: String, level: SensitivityLevel) {
+        let key: String
+        switch eventType {
+        case "braking":
+            brakingSensitivity = level
+            key = brakingSensitivityKey
+        case "hardBraking":
+            hardBrakingSensitivity = level
+            key = hardBrakingSensitivityKey
+        case "acceleration":
+            accelerationSensitivity = level
+            key = accelerationSensitivityKey
+        case "sharpTurn":
+            sharpTurnSensitivity = level
+            key = sharpTurnSensitivityKey
+        case "roughRoad":
+            roughRoadSensitivity = level
+            key = roughRoadSensitivityKey
+        case "horn":
+            hornSensitivity = level
+            key = hornSensitivityKey
+        case "siren":
+            sirenSensitivity = level
+            key = sirenSensitivityKey
+        default:
+            return
+        }
+        
+        userDefaults.set(level.rawValue, forKey: key)
+        userDefaults.synchronize()
+    }
+    
+    func getSensitivity(for eventType: String) -> SensitivityLevel {
+        switch eventType {
+        case "braking": return brakingSensitivity
+        case "hardBraking": return hardBrakingSensitivity
+        case "acceleration": return accelerationSensitivity
+        case "sharpTurn": return sharpTurnSensitivity
+        case "roughRoad": return roughRoadSensitivity
+        case "horn": return hornSensitivity
+        case "siren": return sirenSensitivity
+        default: return .medium
+        }
     }
 }
 
@@ -563,11 +671,11 @@ struct DrivingMetrics: Codable {
         // If no segments yet (very short trip), use comfort-focused calculation
         guard totalSegments > 0 else {
             // Passenger comfort penalties - focus on jarring/uncomfortable events
-            let brakingPenalty = min(Double(brakingEventCount) * 1.2, 10.0) // Braking is uncomfortable
+            let brakingPenalty = min(Double(brakingEventCount) * 0.8, 8.0) // Reduced light braking impact
             let hardBrakingPenalty = min(Double(hardBrakingEventCount) * 3.0, 12.0) // Hard braking very uncomfortable
-            let roughRoadPenalty = min(Double(roughRoadEvents) * 1.0, 8.0) // Bumps are uncomfortable - increased weight
+            let roughRoadPenalty = min(Double(roughRoadEvents) * 0.6, 6.0) // Reduced rough road impact
             let sharpTurnPenalty = min(Double(sharpTurns) * 1.2, 8.0) // Sharp turns can be uncomfortable
-            let speedViolationPenalty = min(Double(speedViolations) * 1.0, 8.0) // Speeding can be stressful
+            let speedViolationPenalty = min(Double(speedViolations) * 0.6, 6.0) // Reduced speeding impact
             let accelerationPenalty = min(Double(accelerationEvents) * 0.2, 2.0) // Smooth acceleration is fine - minimal penalty
             let distractionPenalty = min(Double(phoneDistractions) * 1.8, 10.0) // Distracted driving affects safety/comfort
             let hornPenalty = min(Double(hornEvents) * 1.0, 8.0) // Horn noise is annoying - increased weight
@@ -595,7 +703,7 @@ struct DrivingMetrics: Codable {
         
         // Apply penalties for highly uncomfortable events but allow recovery
         let majorDiscomfortPenalties = min(Double(hardBrakingEventCount) * 1.5, 8.0) + // Hard braking very jarring
-                                      min(Double(roughRoadEvents) * 0.8, 6.0) + // Bumpy roads uncomfortable
+                                      min(Double(roughRoadEvents) * 0.5, 4.0) + // Reduced rough road impact
                                       min(Double(hornEvents + sirenEvents) * 1.2, 8.0) + // Noise pollution
                                       min(slowTrafficTime / 120.0 * 2.0, 12.0) // Traffic frustration
         
@@ -609,10 +717,10 @@ struct DrivingMetrics: Codable {
     
     var qualityDescription: String {
         switch drivingScore {
-        case 90...100: return "Excellent"
-        case 80...89: return "Good"
-        case 70...79: return "Fair" 
-        case 60...69: return "Poor"
+        case 85...100: return "Excellent"
+        case 70...84: return "Good"
+        case 55...69: return "Fair"
+        case 41...54: return "Poor"
         default: return "Needs Improvement"
         }
     }
@@ -1198,6 +1306,44 @@ class SensorManager: ObservableObject {
         setupMotionManager()
     }
     
+    // MARK: - Sensitivity Threshold Helpers
+    private func getThreshold(for eventType: String, sensitivity: SensitivityLevel) -> Double {
+        switch eventType {
+        case "braking":
+            switch sensitivity {
+            case .low: return 0.3    // Higher threshold = less sensitive
+            case .medium: return 0.2 // Baseline
+            case .high: return 0.15  // Lower threshold = more sensitive
+            }
+        case "hardBraking":
+            switch sensitivity {
+            case .low: return 0.7    // Higher threshold = less sensitive  
+            case .medium: return 0.5 // Baseline
+            case .high: return 0.35  // Lower threshold = more sensitive
+            }
+        case "acceleration":
+            switch sensitivity {
+            case .low: return 0.3    // Higher threshold = less sensitive
+            case .medium: return 0.2 // Baseline
+            case .high: return 0.15  // Lower threshold = more sensitive
+            }
+        case "sharpTurn":
+            switch sensitivity {
+            case .low: return 0.4    // Higher threshold = less sensitive (now default)
+            case .medium: return 0.3 // Baseline
+            case .high: return 0.2   // Lower threshold = more sensitive
+            }
+        case "roughRoad":
+            switch sensitivity {
+            case .low: return 0.7    // Higher threshold = less sensitive
+            case .medium: return 0.5 // Baseline
+            case .high: return 0.35  // Lower threshold = more sensitive
+            }
+        default:
+            return 0.2 // Default medium threshold
+        }
+    }
+    
     private func setupMotionManager() {
         isMotionAvailable = motionManager.isDeviceMotionAvailable && 
                           motionManager.isAccelerometerAvailable &&
@@ -1274,7 +1420,7 @@ class SensorManager: ObservableObject {
         }
     }
     
-    func detectBrakingEvent() -> (isBraking: Bool, isHardBraking: Bool, intensity: Double) {
+    func detectBrakingEvent(brakingSensitivity: SensitivityLevel = .medium, hardBrakingSensitivity: SensitivityLevel = .medium) -> (isBraking: Bool, isHardBraking: Bool, intensity: Double) {
         guard accelerationHistory.count >= 5 else { return (false, false, 0) }
         
         let recentAccelerations = Array(accelerationHistory.suffix(5))
@@ -1290,14 +1436,17 @@ class SensorManager: ObservableObject {
         let forwardIntensity = abs(avgForwardDeceleration)
         let combinedIntensity = sqrt(pow(forwardIntensity, 2) + pow(avgLateralAcceleration, 2))
         
-        // More sensitive thresholds to detect even lighter braking
-        let isHardBraking = avgForwardDeceleration < -0.25 || combinedIntensity > 0.35
-        let isBraking = avgForwardDeceleration < -0.1 || combinedIntensity > 0.15
+        // Use dynamic thresholds based on sensitivity settings
+        let brakingThreshold = getThreshold(for: "braking", sensitivity: brakingSensitivity)
+        let hardBrakingThreshold = getThreshold(for: "hardBraking", sensitivity: hardBrakingSensitivity)
+        
+        let isHardBraking = abs(avgForwardDeceleration) > hardBrakingThreshold || combinedIntensity > hardBrakingThreshold
+        let isBraking = abs(avgForwardDeceleration) > brakingThreshold || combinedIntensity > brakingThreshold
         
         return (isBraking, isHardBraking, combinedIntensity)
     }
     
-    func detectRoughRoad() -> Bool {
+    func detectRoughRoad(sensitivity: SensitivityLevel = .medium) -> Bool {
         guard accelerationHistory.count >= 15 else { return false }
         
         let recentAccelerations = Array(accelerationHistory.suffix(15)) // 3 seconds of data
@@ -1315,10 +1464,25 @@ class SensorManager: ObservableObject {
         let minValue = verticalValues.min() ?? 0
         let peakToPeak = maxValue - minValue
         
-        return variance > 0.1 || peakToPeak > 0.5 // More sensitive to catch rougher road conditions
+        // Use dynamic thresholds based on sensitivity setting
+        let varianceThreshold: Double
+        let peakThreshold: Double
+        switch sensitivity {
+        case .low:
+            varianceThreshold = 0.15
+            peakThreshold = 0.8
+        case .medium:
+            varianceThreshold = 0.1
+            peakThreshold = 0.5
+        case .high:
+            varianceThreshold = 0.05
+            peakThreshold = 0.3
+        }
+        
+        return variance > varianceThreshold || peakToPeak > peakThreshold
     }
     
-    func detectSharpTurn() -> Bool {
+    func detectSharpTurn(sensitivity: SensitivityLevel = .medium) -> Bool {
         guard let gyroscope = currentGyroscope,
               accelerationHistory.count >= 3 else { return false }
         
@@ -1333,18 +1497,22 @@ class SensorManager: ObservableObject {
         
         let avgLateralAcceleration = recentAccelerations.reduce(0) { $0 + abs($1.y) } / Double(recentAccelerations.count)
         
-        // Detect only more significant cornering (less sensitive)
-        let isSharpRotation = rotationMagnitude > 1.0 // Increased threshold to reduce false positives  
-        let isHighLateralForce = avgLateralAcceleration > 0.4 // Increased threshold to catch only sharper turns
+        // Use dynamic threshold based on sensitivity setting
+        let threshold = getThreshold(for: "sharpTurn", sensitivity: sensitivity)
         
-        return isSharpRotation || isHighLateralForce
+        // For rotation, we adjust the threshold differently (gyroscope uses different scale)
+        switch sensitivity {
+        case .low: return rotationMagnitude > 1.5 || avgLateralAcceleration > threshold
+        case .medium: return rotationMagnitude > 1.0 || avgLateralAcceleration > threshold
+        case .high: return rotationMagnitude > 0.5 || avgLateralAcceleration > threshold
+        }
     }
     
     func detectSpeedViolation(currentSpeed: Double, speedLimit: Double) -> Bool {
         return currentSpeed > speedLimit
     }
     
-    func detectAccelerationEvent() -> Bool {
+    func detectAccelerationEvent(sensitivity: SensitivityLevel = .medium) -> Bool {
         guard accelerationHistory.count >= 5 else { return false }
         
         // Prevent duplicate detection within 2 seconds
@@ -1361,8 +1529,9 @@ class SensorManager: ObservableObject {
         // Calculate forward acceleration (positive X-axis indicates acceleration)
         let avgForwardAcceleration = recentAccelerations.reduce(0) { $0 + $1.x } / Double(recentAccelerations.count)
         
-        // Detect even light acceleration events (positive forward acceleration)
-        let isAccelerating = avgForwardAcceleration > 0.08 // Even more sensitive threshold for detecting acceleration
+        // Use dynamic threshold based on sensitivity setting
+        let threshold = getThreshold(for: "acceleration", sensitivity: sensitivity)
+        let isAccelerating = avgForwardAcceleration > threshold
         
         if isAccelerating {
             lastAccelerationEventTime = now
@@ -2356,7 +2525,10 @@ class CommuteTracker: ObservableObject {
         let currentLocation = locationManager.currentLocation
         
         // Optimized braking detection with separate counts
-        let brakingResult = sensorManager.detectBrakingEvent()
+        let brakingResult = sensorManager.detectBrakingEvent(
+            brakingSensitivity: settingsManager.brakingSensitivity,
+            hardBrakingSensitivity: settingsManager.hardBrakingSensitivity
+        )
         if brakingResult.isBraking {
             currentMetrics.brakingEventCount += 1
             currentMetrics.addEvent("braking")
@@ -2385,7 +2557,7 @@ class CommuteTracker: ObservableObject {
             }
         }
         
-        if sensorManager.detectRoughRoad() {
+        if sensorManager.detectRoughRoad(sensitivity: settingsManager.roughRoadSensitivity) {
             currentMetrics.roughRoadEvents += 1
             currentMetrics.addEvent("roughRoad")
             
@@ -2407,7 +2579,7 @@ class CommuteTracker: ObservableObject {
             }
         }
         
-        if sensorManager.detectSharpTurn() {
+        if sensorManager.detectSharpTurn(sensitivity: settingsManager.sharpTurnSensitivity) {
             currentMetrics.sharpTurns += 1
             currentMetrics.addEvent("sharpTurn")
             
@@ -2430,7 +2602,7 @@ class CommuteTracker: ObservableObject {
         }
         
         // Acceleration event detection
-        if sensorManager.detectAccelerationEvent() {
+        if sensorManager.detectAccelerationEvent(sensitivity: settingsManager.accelerationSensitivity) {
             currentMetrics.accelerationEvents += 1
             currentMetrics.addEvent("acceleration")
             
@@ -3207,8 +3379,8 @@ struct ContentView: View {
     private let stableLocationRadius: CLLocationDistance = 100 // 100 meters
     @StateObject private var locationManager = LocationManager()
     @StateObject private var commuteTracker = CommuteTracker()
-    @StateObject private var sensorManager = SensorManager()
     @StateObject private var settingsManager = SettingsManager()
+    @StateObject private var sensorManager = SensorManager()
     @StateObject private var tripManager = TripManager()
     @StateObject private var soundAnalysisManager = SoundAnalysisManager()
     @State private var selectedTab = 0
@@ -3226,6 +3398,7 @@ struct ContentView: View {
     @State private var historySortDirection: SortDirection = .descending
     @State private var selectedCommuteFilter: CommuteFilterOption = .all
     @State private var showTripEditor = false
+    @State private var showSensitivitySettings = false
     @State private var showSplashScreen = true
     @State private var showOnboarding = false
     @State private var showDocumentPicker = false
@@ -3322,11 +3495,15 @@ struct ContentView: View {
             // Clean up when app is terminated
             UIApplication.shared.isIdleTimerDisabled = false
         }
+        .onChange(of: showDocumentPicker) { _, newValue in
+            print("showDocumentPicker changed to: \(newValue)")
+        }
         .fileImporter(
             isPresented: $showDocumentPicker,
-            allowedContentTypes: [.json],
+            allowedContentTypes: [.json, .data, .plainText, .text],
             allowsMultipleSelection: false
         ) { result in
+            print("File importer triggered with result: \(result)")
             switch result {
             case .success(let urls):
                 guard let url = urls.first else { return }
@@ -3340,62 +3517,42 @@ struct ContentView: View {
                 }
                 
                 do {
+                    // Check file extension to determine import type
+                    let pathExtension = url.pathExtension.lowercased()
                     
-                    let data = try Data(contentsOf: url)
-                    
-                    handleImportedData(data)
+                    if pathExtension == "csv" {
+                        // Handle CSV import
+                        var csvContent: String
+                        if let utf8Content = try? String(contentsOf: url, encoding: .utf8) {
+                            csvContent = utf8Content
+                        } else if let asciiContent = try? String(contentsOf: url, encoding: .ascii) {
+                            csvContent = asciiContent
+                        } else {
+                            throw NSError(domain: "CSVImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not read file with UTF-8 or ASCII encoding"])
+                        }
+                        
+                        let importedCount = try commuteTracker.importFromCSV(csvContent)
+                        
+                        DispatchQueue.main.async {
+                            csvImportResult = .success(importedCount)
+                        }
+                    } else {
+                        // Handle JSON backup import
+                        let data = try Data(contentsOf: url)
+                        handleImportedData(data)
+                    }
                 } catch {
-                    importResult = .failure("Failed to read backup file: \(error.localizedDescription)")
+                    if url.pathExtension.lowercased() == "csv" {
+                        DispatchQueue.main.async {
+                            csvImportResult = .failure("Failed to import CSV: \(error.localizedDescription)")
+                        }
+                    } else {
+                        importResult = .failure("Failed to read backup file: \(error.localizedDescription)")
+                    }
                 }
                 
             case .failure(let error):
                 importResult = .failure("Failed to select file: \(error.localizedDescription)")
-            }
-        }
-        .fileImporter(
-            isPresented: $showCSVImporter,
-            allowedContentTypes: [.plainText, .text],
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                
-                // Start accessing security-scoped resource
-                let hasAccess = url.startAccessingSecurityScopedResource()
-                defer {
-                    if hasAccess {
-                        url.stopAccessingSecurityScopedResource()
-                    }
-                }
-                
-                do {
-                    
-                    // Try different encodings if UTF-8 fails
-                    var csvContent: String
-                    if let utf8Content = try? String(contentsOf: url, encoding: .utf8) {
-                        csvContent = utf8Content
-                    } else if let asciiContent = try? String(contentsOf: url, encoding: .ascii) {
-                        csvContent = asciiContent
-                    } else {
-                        throw NSError(domain: "CSVImport", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not read file with UTF-8 or ASCII encoding"])
-                    }
-                    
-                    
-                    let importedCount = try commuteTracker.importFromCSV(csvContent)
-                    
-                    DispatchQueue.main.async {
-                        csvImportResult = .success(importedCount)
-                    }
-                    
-                } catch {
-                    DispatchQueue.main.async {
-                        csvImportResult = .failure("Failed to import CSV: \(error.localizedDescription)")
-                    }
-                }
-                
-            case .failure(let error):
-                csvImportResult = .failure("Failed to select CSV file: \(error.localizedDescription)")
             }
         }
         .alert("CSV Import Result", isPresented: .constant(csvImportResult != nil)) {
@@ -4006,10 +4163,11 @@ struct ContentView: View {
     
     private func scoreColor(_ score: Int) -> Color {
         switch score {
-        case 90...100: return .green
-        case 80...89: return .blue
-        case 70...79: return .orange
-        default: return .red
+        case 85...100: return .green     // Excellent - Green
+        case 70...84: return .blue       // Good - Blue  
+        case 55...69: return .orange     // Fair - Orange
+        case 41...54: return Color.yellow // Poor - Yellow
+        default: return .red             // Needs Improvement (0-40) - Red
         }
     }
     
@@ -5209,20 +5367,27 @@ struct ContentView: View {
         }
         
         // Calculate actual statistics from filtered commutes (already guarded by isEmpty check above)
+        let commuteCount = max(1, filteredCommutes.count) // Prevent division by zero
         let totalDuration = filteredCommutes.reduce(0) { $0 + $1.duration }
-        let avgDuration = totalDuration / Double(filteredCommutes.count)
-        _ = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.drivingScore }) / Double(filteredCommutes.count)
+        let avgDuration = totalDuration / Double(commuteCount)
+        _ = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.drivingScore }) / Double(commuteCount)
         let totalTrafficTime = filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.slowTrafficTime }
-        let avgTrafficTime = totalTrafficTime / Double(filteredCommutes.count)
-        let avgSpeed = filteredCommutes.reduce(0.0) { $0 + $1.drivingMetrics.averageSpeed } / Double(filteredCommutes.count)
+        let avgTrafficTime = totalTrafficTime / Double(commuteCount)
+        let avgSpeed = filteredCommutes.reduce(0.0) { $0 + $1.drivingMetrics.averageSpeed } / Double(commuteCount)
         
         // Calculate average events per trip
-        let avgBraking = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.brakingEventCount }) / Double(filteredCommutes.count)
-        let avgHardBraking = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.hardBrakingEventCount }) / Double(filteredCommutes.count)
-        let avgSpeeding = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.speedViolations }) / Double(filteredCommutes.count)
-        let avgTurns = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.sharpTurns }) / Double(filteredCommutes.count)
-        let avgRoughRoad = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.roughRoadEvents }) / Double(filteredCommutes.count)
-        let avgAcceleration = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.accelerationEvents }) / Double(filteredCommutes.count)
+        let avgBraking = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.brakingEventCount }) / Double(commuteCount)
+        let avgHardBraking = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.hardBrakingEventCount }) / Double(commuteCount)
+        let avgSpeeding = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.speedViolations }) / Double(commuteCount)
+        let avgTurns = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.sharpTurns }) / Double(commuteCount)
+        let avgRoughRoad = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.roughRoadEvents }) / Double(commuteCount)
+        let avgAcceleration = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.accelerationEvents }) / Double(commuteCount)
+        
+        // Helper function to safely format doubles
+        func safeFormat(_ value: Double, format: String = "%.1f") -> String {
+            guard value.isFinite else { return "0.0" }
+            return String(format: format, value)
+        }
         
         return AnyView(
             CardView {
@@ -5259,7 +5424,7 @@ struct ContentView: View {
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                             
-                            Text("\(String(format: "%.1f", avgSpeed))km/h")
+                            Text("\(safeFormat(avgSpeed))km/h")
                                 .font(.subheadline)
                                 .fontWeight(.medium)
                                 .foregroundColor(.blue)
@@ -5294,50 +5459,68 @@ struct ContentView: View {
                         VStack(spacing: DesignSystem.Spacing.xs) {
                             // First row
                             HStack(spacing: DesignSystem.Spacing.md) {
-                                EventStatCard(
-                                    icon: "backward.fill",
-                                    title: "Braking",
-                                    value: String(format: "%.1f", avgBraking),
-                                    color: .blue
-                                )
+                                VStack {
+                                    Image(systemName: "backward.fill")
+                                        .foregroundColor(.blue)
+                                    Text("Braking")
+                                        .font(.caption2)
+                                    Text(safeFormat(avgBraking))
+                                        .font(.subheadline)
+                                }
+                                .frame(maxWidth: .infinity)
                                 
-                                EventStatCard(
-                                    icon: "exclamationmark.triangle.fill",
-                                    title: "Hard Braking",
-                                    value: String(format: "%.1f", avgHardBraking),
-                                    color: .red
-                                )
+                                VStack {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundColor(.red)
+                                    Text("Hard Braking")
+                                        .font(.caption2)
+                                    Text(safeFormat(avgHardBraking))
+                                        .font(.subheadline)
+                                }
+                                .frame(maxWidth: .infinity)
                                 
-                                EventStatCard(
-                                    icon: "speedometer",
-                                    title: "Speeding",
-                                    value: String(format: "%.1f", avgSpeeding),
-                                    color: .orange
-                                )
+                                VStack {
+                                    Image(systemName: "speedometer")
+                                        .foregroundColor(.orange)
+                                    Text("Speeding")
+                                        .font(.caption2)
+                                    Text(safeFormat(avgSpeeding))
+                                        .font(.subheadline)
+                                }
+                                .frame(maxWidth: .infinity)
                             }
                             
                             // Second row
                             HStack(spacing: DesignSystem.Spacing.md) {
-                                EventStatCard(
-                                    icon: "arrow.triangle.turn.up.right.circle",
-                                    title: "Sharp Turns",
-                                    value: String(format: "%.1f", avgTurns),
-                                    color: .purple
-                                )
+                                VStack {
+                                    Image(systemName: "arrow.triangle.turn.up.right.circle")
+                                        .foregroundColor(.purple)
+                                    Text("Sharp Turns")
+                                        .font(.caption2)
+                                    Text(safeFormat(avgTurns))
+                                        .font(.subheadline)
+                                }
+                                .frame(maxWidth: .infinity)
                                 
-                                EventStatCard(
-                                    icon: "road.lanes.curved.right",
-                                    title: "Rough Roads",
-                                    value: String(format: "%.1f", avgRoughRoad),
-                                    color: .brown
-                                )
+                                VStack {
+                                    Image(systemName: "road.lanes.curved.right")
+                                        .foregroundColor(.brown)
+                                    Text("Rough Roads")
+                                        .font(.caption2)
+                                    Text(safeFormat(avgRoughRoad))
+                                        .font(.subheadline)
+                                }
+                                .frame(maxWidth: .infinity)
                                 
-                                EventStatCard(
-                                    icon: "forward.fill",
-                                    title: "Acceleration",
-                                    value: String(format: "%.1f", avgAcceleration),
-                                    color: .green
-                                )
+                                VStack {
+                                    Image(systemName: "forward.fill")
+                                        .foregroundColor(.green)
+                                    Text("Acceleration")
+                                        .font(.caption2)
+                                    Text(safeFormat(avgAcceleration))
+                                        .font(.subheadline)
+                                }
+                                .frame(maxWidth: .infinity)
                             }
                         }
                     }
@@ -6165,173 +6348,180 @@ struct ContentView: View {
     private func drivingPreferencesSection() -> some View {
         CardView {
             VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
-                HStack {
-                    Label {
-                        Text("Driving Preferences")
-                            .font(DesignSystem.Typography.title3)
-                            .foregroundColor(DesignSystem.Colors.text)
-                    } icon: {
-                        Image(systemName: "car.fill")
-                            .foregroundColor(DesignSystem.Colors.primary)
-                    }
-                    
-                    Spacer()
-                }
-                
-                HStack(spacing: DesignSystem.Spacing.md) {
-                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                        Text("Speed Limit")
-                            .font(DesignSystem.Typography.headline)
-                            .foregroundColor(DesignSystem.Colors.text)
-                        
-                        Text("Speed violations detected above this limit")
-                            .font(DesignSystem.Typography.caption)
-                            .foregroundColor(DesignSystem.Colors.secondaryText)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    
-                    Spacer()
-                    
-                    HStack(spacing: DesignSystem.Spacing.xs) {
-                        Button(action: {
-                            let newValue = max(30, settingsManager.speedLimitThreshold - 5)
-                            settingsManager.saveSpeedLimit(newValue)
-                        }) {
-                            Image(systemName: "minus.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(DesignSystem.Colors.primary)
-                        }
-                        .disabled(settingsManager.speedLimitThreshold <= 30)
-                        .buttonStyle(.plain)
-                        
-                        VStack(spacing: 1) {
-                            Text("\(Int(settingsManager.speedLimitThreshold))")
-                                .font(DesignSystem.Typography.title3)
-                                .foregroundColor(DesignSystem.Colors.primary)
-                                .fontWeight(.bold)
-                            
-                            Text("km/h")
-                                .font(.caption2)
-                                .foregroundColor(DesignSystem.Colors.secondaryText)
-                                .fontWeight(.medium)
-                        }
-                        .frame(minWidth: 50)
-                        .padding(.horizontal, DesignSystem.Spacing.xs)
-                        .padding(.vertical, 4)
-                        .background(
-                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                .fill(DesignSystem.Colors.primary.opacity(0.1))
-                        )
-                        
-                        Button(action: {
-                            let newValue = min(150, settingsManager.speedLimitThreshold + 5)
-                            settingsManager.saveSpeedLimit(newValue)
-                        }) {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(DesignSystem.Colors.primary)
-                        }
-                        .disabled(settingsManager.speedLimitThreshold >= 150)
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(DesignSystem.Spacing.sm)
-                .background(
-                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                        .fill(DesignSystem.Colors.cardBackground)
-                        .shadow(color: DesignSystem.Shadow.light, radius: 1, x: 0, y: 1)
-                )
-                
-                VStack(spacing: DesignSystem.Spacing.md) {
-                    SettingToggle(
-                        title: "Keep Screen On During Trips",
-                        description: "Prevent device from sleeping while tracking",
-                        isOn: $settingsManager.keepScreenOn,
-                        action: { newValue in
-                            settingsManager.saveKeepScreenOn(newValue)
-                            if isTracking {
-                                UIApplication.shared.isIdleTimerDisabled = newValue
-                            }
-                        }
-                    )
-                    
-                    SettingToggle(
-                        title: "Smart Trip Ordering",
-                        description: "Order trips by location relevance and history",
-                        isOn: $settingsManager.useLocationBasedOrdering,
-                        action: { newValue in
-                            settingsManager.saveLocationOrdering(newValue)
-                        }
-                    )
-                }
-                
-                // Auto-End Time Control
-                HStack(spacing: DesignSystem.Spacing.md) {
-                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                        Text("Auto-End Trips")
-                            .font(DesignSystem.Typography.headline)
-                            .foregroundColor(DesignSystem.Colors.text)
-                        
-                        Text("Automatically end trips after being at the same location for this long")
-                            .font(DesignSystem.Typography.caption)
-                            .foregroundColor(DesignSystem.Colors.secondaryText)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    
-                    Spacer()
-                    
-                    HStack(spacing: DesignSystem.Spacing.xs) {
-                        Button(action: {
-                            let newValue = max(1.0, settingsManager.autoEndTimeHours - 0.5)
-                            settingsManager.saveAutoEndTime(newValue)
-                        }) {
-                            Image(systemName: "minus.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(DesignSystem.Colors.primary)
-                        }
-                        .disabled(settingsManager.autoEndTimeHours <= 1.0)
-                        .buttonStyle(.plain)
-                        
-                        VStack(spacing: 1) {
-                            Text(settingsManager.autoEndTimeHours == floor(settingsManager.autoEndTimeHours) ? 
-                                 "\(Int(settingsManager.autoEndTimeHours))" : 
-                                 String(format: "%.1f", settingsManager.autoEndTimeHours))
-                                .font(DesignSystem.Typography.title3)
-                                .foregroundColor(DesignSystem.Colors.primary)
-                                .fontWeight(.bold)
-                            
-                            Text("hours")
-                                .font(.caption2)
-                                .foregroundColor(DesignSystem.Colors.secondaryText)
-                                .fontWeight(.medium)
-                        }
-                        .frame(minWidth: 50)
-                        .padding(.horizontal, DesignSystem.Spacing.xs)
-                        .padding(.vertical, 4)
-                        .background(
-                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                .fill(DesignSystem.Colors.primary.opacity(0.1))
-                        )
-                        
-                        Button(action: {
-                            let newValue = min(12.0, settingsManager.autoEndTimeHours + 0.5)
-                            settingsManager.saveAutoEndTime(newValue)
-                        }) {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(DesignSystem.Colors.primary)
-                        }
-                        .disabled(settingsManager.autoEndTimeHours >= 12.0)
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(DesignSystem.Spacing.sm)
-                .background(
-                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                        .fill(DesignSystem.Colors.cardBackground)
-                        .shadow(color: DesignSystem.Shadow.light, radius: 1, x: 0, y: 1)
-                )
+                drivingPreferencesHeader()
+                speedLimitSetting()
+                autoEndTimeSetting()
+                generalSettingsToggles()
             }
+        }
+    }
+    
+    private func drivingPreferencesHeader() -> some View {
+        HStack {
+            Label {
+                Text("Driving Preferences")
+                    .font(DesignSystem.Typography.title3)
+                    .foregroundColor(DesignSystem.Colors.text)
+            } icon: {
+                Image(systemName: "car.fill")
+                    .foregroundColor(DesignSystem.Colors.primary)
+            }
+            
+            Spacer()
+        }
+    }
+    
+    private func speedLimitSetting() -> some View {
+        let currentThreshold = settingsManager.speedLimitThreshold
+        let safeThreshold = currentThreshold.isFinite ? currentThreshold : 80.0
+        let displayValue = Int(max(30, min(150, safeThreshold)))
+        
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Speed Limit")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    
+                    Text("Speed violations detected above this limit")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                
+                Spacer()
+                
+                HStack(spacing: 8) {
+                    Button(action: {
+                        let newValue = max(30, safeThreshold - 5)
+                        settingsManager.saveSpeedLimit(newValue)
+                    }) {
+                        Image(systemName: "minus.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(.blue)
+                    }
+                    .disabled(safeThreshold <= 30)
+                    .buttonStyle(.plain)
+                    
+                    VStack(spacing: 2) {
+                        Text("\(displayValue)")
+                            .font(.title3)
+                            .fontWeight(.bold)
+                            .foregroundColor(.blue)
+                        
+                        Text("km/h")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(minWidth: 50)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.blue.opacity(0.1))
+                    .cornerRadius(6)
+                    
+                    Button(action: {
+                        let newValue = min(150, safeThreshold + 5)
+                        settingsManager.saveSpeedLimit(newValue)
+                    }) {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(.blue)
+                    }
+                    .disabled(safeThreshold >= 150)
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+    
+    private func autoEndTimeSetting() -> some View {
+        let currentHours = settingsManager.autoEndTimeHours
+        let safeHours = currentHours.isFinite ? currentHours : 4.0
+        let clampedHours = max(1.0, min(12.0, safeHours))
+        let displayText = clampedHours == floor(clampedHours) ? 
+            "\(Int(clampedHours))" : 
+            String(format: "%.1f", clampedHours)
+        
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Auto-End Trips")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    
+                    Text("Automatically end trips after being at the same location for this long")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                
+                Spacer()
+                
+                HStack(spacing: 8) {
+                    Button(action: {
+                        let newValue = max(1.0, safeHours - 0.5)
+                        settingsManager.saveAutoEndTime(newValue)
+                    }) {
+                        Image(systemName: "minus.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(.green)
+                    }
+                    .disabled(safeHours <= 1.0)
+                    .buttonStyle(.plain)
+                    
+                    VStack(spacing: 2) {
+                        Text(displayText)
+                            .font(.title3)
+                            .fontWeight(.bold)
+                            .foregroundColor(.green)
+                        
+                        Text("hours")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(minWidth: 50)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.green.opacity(0.1))
+                    .cornerRadius(6)
+                    
+                    Button(action: {
+                        let newValue = min(12.0, safeHours + 0.5)
+                        settingsManager.saveAutoEndTime(newValue)
+                    }) {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(.green)
+                    }
+                    .disabled(safeHours >= 12.0)
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+    
+    private func generalSettingsToggles() -> some View {
+        VStack(spacing: DesignSystem.Spacing.md) {
+            SettingToggle(
+                title: "Keep Screen On During Trips",
+                description: "Prevent device from sleeping while tracking",
+                isOn: $settingsManager.keepScreenOn,
+                action: { newValue in
+                    settingsManager.saveKeepScreenOn(newValue)
+                    if isTracking {
+                        UIApplication.shared.isIdleTimerDisabled = newValue
+                    }
+                }
+            )
+            
+            SettingToggle(
+                title: "Smart Trip Ordering",
+                description: "Order trips by location relevance and history",
+                isOn: $settingsManager.useLocationBasedOrdering,
+                action: { newValue in
+                    settingsManager.saveLocationOrdering(newValue)
+                }
+            )
         }
     }
     
@@ -6515,6 +6705,30 @@ struct ContentView: View {
                     )
                 }
                 
+                // Sensitivity Controls link
+                Button(action: {
+                    showSensitivitySettings = true
+                }) {
+                    HStack {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundColor(DesignSystem.Colors.primary)
+                            .frame(width: 20)
+                        
+                        Text("Sensitivity Controls")
+                            .font(DesignSystem.Typography.body)
+                            .foregroundColor(DesignSystem.Colors.text)
+                        
+                        Spacer()
+                        
+                        Image(systemName: "chevron.right")
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                            .font(.caption)
+                    }
+                    .padding(.vertical, DesignSystem.Spacing.xs)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(PlainButtonStyle())
+                
                 // Info about sensor usage
                 HStack {
                     Image(systemName: "info.circle")
@@ -6548,91 +6762,54 @@ struct ContentView: View {
                     }
                     
                     Spacer()
+                    
+                    Text("\(commuteTracker.commutes.count) trips")
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.secondaryText)
+                        .padding(.horizontal, DesignSystem.Spacing.sm)
+                        .padding(.vertical, DesignSystem.Spacing.xs)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                .fill(DesignSystem.Colors.background)
+                        )
                 }
                 
-                VStack(spacing: DesignSystem.Spacing.md) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                            Text("Backup & Restore")
-                                .font(DesignSystem.Typography.headline)
-                                .foregroundColor(DesignSystem.Colors.text)
-                            
-                            Text("Export your trips and settings or restore from a backup")
-                                .font(DesignSystem.Typography.caption)
-                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                HStack(spacing: DesignSystem.Spacing.md) {
+                    // Export Button
+                    Button(action: {
+                        if let data = commuteTracker.exportAllData() {
+                            let filename = "MyCommute_Backup_\(DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .none).replacingOccurrences(of: "/", with: "_")).json"
+                            shareData(data, filename: filename)
                         }
-                        
-                        Spacer()
-                        
-                        Text("\(commuteTracker.commutes.count)")
-                            .font(DesignSystem.Typography.callout)
-                            .foregroundColor(DesignSystem.Colors.secondaryText)
-                            .padding(.horizontal, DesignSystem.Spacing.sm)
-                            .padding(.vertical, DesignSystem.Spacing.xs)
-                            .background(
-                                RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                    .fill(DesignSystem.Colors.background)
-                            )
+                    }) {
+                        HStack {
+                            Image(systemName: "square.and.arrow.up")
+                            Text("Export")
+                        }
+                        .font(DesignSystem.Typography.body)
+                        .fontWeight(.medium)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, DesignSystem.Spacing.lg)
+                        .padding(.vertical, DesignSystem.Spacing.md)
+                        .background(DesignSystem.Colors.primary)
+                        .cornerRadius(DesignSystem.CornerRadius.md)
                     }
+                    .buttonStyle(PlainButtonStyle())
                     
-                    VStack(spacing: DesignSystem.Spacing.sm) {
-                        // Export Button
-                        AnimatedButton(action: {
-                            if let data = commuteTracker.exportAllData() {
-                                let filename = "MyCommute_Backup_\(DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .none).replacingOccurrences(of: "/", with: "_")).json"
-                                shareData(data, filename: filename)
-                            }
-                        }) {
-                            HStack {
-                                Image(systemName: "square.and.arrow.up")
-                                    .font(.subheadline)
-                                Text("Export Data")
-                                    .font(DesignSystem.Typography.subheadline)
-                                    .fontWeight(.medium)
-                                Spacer()
-                            }
-                            .foregroundColor(.white)
-                            .padding(.horizontal, DesignSystem.Spacing.lg)
-                            .padding(.vertical, DesignSystem.Spacing.md)
-                            .background(
-                                RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
-                                    .fill(DesignSystem.Colors.primary)
-                            )
-                        }
-                        
-                        // Import Button
-                        Menu {
-                            Button(action: {
-                                showDocumentPicker = true
-                            }) {
-                                Label("Import Backup (JSON)", systemImage: "doc.text")
-                            }
-                            
-                            Button(action: {
-                                showCSVImporter = true
-                            }) {
-                                Label("Import CSV Data", systemImage: "tablecells")
-                            }
-                        } label: {
-                            HStack {
-                                Image(systemName: "square.and.arrow.down")
-                                    .font(.subheadline)
-                                Text("Import Data")
-                                    .font(DesignSystem.Typography.subheadline)
-                                    .fontWeight(.medium)
-                                Spacer()
-                            }
-                            .foregroundColor(DesignSystem.Colors.primary)
-                            .padding(.horizontal, DesignSystem.Spacing.lg)
-                            .padding(.vertical, DesignSystem.Spacing.md)
-                            .background(
-                                RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
-                                    .fill(DesignSystem.Colors.primary.opacity(0.1))
-                            )
-                        }
-                        
-                        Spacer()
+                    // Import Button
+                    Button("Import CSV/JSON") {
+                        print("Import button tapped - showDocumentPicker: \(showDocumentPicker)")
+                        showDocumentPicker = true
+                        print("Import button tapped - showDocumentPicker set to: \(showDocumentPicker)")
                     }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(
+                        RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
+                            .fill(Color.green)
+                    )
+                    .foregroundColor(.white)
+                    .fontWeight(.medium)
                 }
             }
         }
@@ -6820,6 +6997,9 @@ struct ContentView: View {
                 }
             } message: {
                 Text("This will permanently delete all your trip history and data. This action cannot be undone.")
+            }
+            .sheet(isPresented: $showSensitivitySettings) {
+                AdvancedSensitivitySettingsView(settingsManager: settingsManager)
             }
         }
     }
@@ -7101,7 +7281,7 @@ struct ContentView: View {
             Divider()
             
             Button {
-                showCSVImporter = true
+                showDocumentPicker = true
             } label: {
                 Label("Import CSV", systemImage: "square.and.arrow.down")
             }
@@ -8139,7 +8319,7 @@ struct DriveQualityExplanationView: View {
                             .fontWeight(.bold)
                             .foregroundColor(DesignSystem.Colors.text)
                         
-                        Text("A comprehensive analysis of your driving behavior using real-time sensor data")
+                        Text("Enhanced passenger comfort analysis with balanced scoring for more realistic quality assessments")
                             .font(.subheadline)
                             .foregroundColor(DesignSystem.Colors.secondaryText)
                     }
@@ -8183,7 +8363,7 @@ struct DriveQualityExplanationView: View {
                                 ScoreComponent(
                                     name: "Stress Factors",
                                     weight: "25%",
-                                    description: "Measures stress-inducing factors like excessive speeding, traffic delays, and environmental noise",
+                                    description: "Measures stress-inducing factors with reduced penalties for minor events like light braking, rough roads, and moderate speeding",
                                     color: .orange
                                 )
                                 
@@ -8206,10 +8386,12 @@ struct DriveQualityExplanationView: View {
                                     title: "Passenger Comfort Analysis",
                                     details: [
                                         "Samples accelerometer data at 50Hz",
-                                        "Applies low-pass filter to reduce noise",
-                                        "Detects jarring braking events > 0.5g",
-                                        "Minimally weights smooth acceleration (< 0.3g)",
-                                        "Prioritizes bump and vibration detection"
+                                        "Applies low-pass filter to reduce noise", 
+                                        "Detects light braking events > 0.2g (reduced impact)",
+                                        "Detects hard braking events > 0.5g",
+                                        "Sharp turn sensitivity: Low (0.4g) by default",
+                                        "Rough road detection > 0.5g (reduced impact)",
+                                        "Minimally weights smooth acceleration (< 0.2g)"
                                     ]
                                 )
                                 
@@ -8259,9 +8441,12 @@ struct DriveQualityExplanationView: View {
                                     ForEach([
                                         "75% based on smooth, comfortable 30-second segments",
                                         "25% based on absence of jarring events", 
-                                        "Major penalties: hard braking, bumpy roads, noise, traffic",
-                                        "Minimal penalty: smooth acceleration (not uncomfortable)",
-                                        "Score reflects overall ride enjoyability for passengers"
+                                        "Reduced penalties: light braking (33% less impact)",
+                                        "Reduced penalties: rough roads (40% less impact)",
+                                        "Reduced penalties: speeding violations (40% less impact)", 
+                                        "Sharp turns: Lower sensitivity by default for higher scores",
+                                        "Major penalties still apply: hard braking, traffic, distractions",
+                                        "Minimal penalty: smooth acceleration (not uncomfortable)"
                                     ], id: \.self) { penalty in
                                         Text("• \(penalty)")
                                             .font(.caption)
@@ -8278,11 +8463,11 @@ struct DriveQualityExplanationView: View {
                         icon: "star.fill",
                         content: {
                             VStack(spacing: 12) {
-                                QualityRange(range: "90-100", label: "Excellent", description: "Exceptional driving with minimal events", color: .green)
-                                QualityRange(range: "80-89", label: "Good", description: "Solid driving with minor improvements needed", color: .blue)
-                                QualityRange(range: "70-79", label: "Average", description: "Acceptable driving with room for improvement", color: .orange)
-                                QualityRange(range: "60-69", label: "Fair", description: "Some concerning driving behaviors detected", color: .yellow)
-                                QualityRange(range: "0-59", label: "Poor", description: "Significant driving issues requiring attention", color: .red)
+                                QualityRange(range: "85-100", label: "Excellent", description: "Exceptional passenger comfort with smooth ride quality", color: .green)
+                                QualityRange(range: "70-84", label: "Good", description: "Comfortable ride with only minor disruptions", color: .blue)
+                                QualityRange(range: "55-69", label: "Fair", description: "Acceptable comfort level with moderate events", color: .orange)
+                                QualityRange(range: "41-54", label: "Poor", description: "Uncomfortable ride with frequent disruptions", color: .yellow)
+                                QualityRange(range: "0-40", label: "Needs Improvement", description: "Significantly uncomfortable ride requiring immediate attention", color: .red)
                             }
                         }
                     )
@@ -8744,6 +8929,185 @@ struct TimeWindowExample: View {
         .cornerRadius(6)
     }
 }
+
+// MARK: - Advanced Sensitivity Settings View
+struct AdvancedSensitivitySettingsView: View {
+    @ObservedObject var settingsManager: SettingsManager
+    @Environment(\.presentationMode) var presentationMode
+    
+    private let eventTypes: [(id: String, name: String, icon: String, color: Color)] = [
+        ("braking", "Braking", "backward.fill", .orange),
+        ("hardBraking", "Hard Braking", "exclamationmark.triangle.fill", .red),
+        ("acceleration", "Acceleration", "forward.fill", .green),
+        ("sharpTurn", "Sharp Turn", "arrow.triangle.turn.up.right.circle", .yellow),
+        ("roughRoad", "Rough Road", "road.lanes", .brown),
+        ("horn", "Horn", "speaker.wave.3.fill", .blue),
+        ("siren", "Siren", "music.note", .purple)
+    ]
+    
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                LazyVStack(spacing: DesignSystem.Spacing.lg) {
+                    ForEach(eventTypes, id: \.id) { eventType in
+                        EventSensitivityCard(
+                            eventType: eventType,
+                            currentLevel: settingsManager.getSensitivity(for: eventType.id),
+                            onLevelChange: { newLevel in
+                                settingsManager.saveSensitivity(for: eventType.id, level: newLevel)
+                            }
+                        )
+                    }
+                }
+                .padding(DesignSystem.Spacing.md)
+            }
+            .navigationTitle("Event Sensitivity")
+            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarItems(
+                trailing: Button("Done") {
+                    presentationMode.wrappedValue.dismiss()
+                }
+                .foregroundColor(DesignSystem.Colors.primary)
+                .fontWeight(.medium)
+            )
+        }
+    }
+    
+    private func headerSection() -> some View {
+        VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+            HStack {
+                Image(systemName: "slider.horizontal.3")
+                    .foregroundColor(DesignSystem.Colors.primary)
+                    .font(.title2)
+                
+                Text("Detection Sensitivity")
+                    .font(DesignSystem.Typography.title2)
+                    .fontWeight(.bold)
+                
+                Spacer()
+            }
+            
+            Text("Adjust how sensitive the app is to different driving events. The description below each event shows what the selected sensitivity level detects.")
+                .font(DesignSystem.Typography.body)
+                .foregroundColor(DesignSystem.Colors.secondaryText)
+        }
+        .padding(DesignSystem.Spacing.lg)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
+                .fill(DesignSystem.Colors.primary.opacity(0.1))
+        )
+    }
+    
+}
+
+struct EventSensitivityCard: View {
+    let eventType: (id: String, name: String, icon: String, color: Color)
+    let currentLevel: SensitivityLevel
+    let onLevelChange: (SensitivityLevel) -> Void
+    
+    var body: some View {
+        CardView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                // Header with event info
+                HStack(spacing: DesignSystem.Spacing.md) {
+                    Image(systemName: eventType.icon)
+                        .foregroundColor(eventType.color)
+                        .font(.title2)
+                        .frame(width: 28)
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(eventType.name)
+                            .font(DesignSystem.Typography.headline)
+                            .fontWeight(.semibold)
+                        
+                        Text(getDescriptionFor(eventType: eventType.id, level: currentLevel))
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                    }
+                    
+                    Spacer()
+                }
+                
+                // Sensitivity level selector
+                HStack(spacing: DesignSystem.Spacing.sm) {
+                    ForEach(SensitivityLevel.allCases, id: \.self) { level in
+                        Button(action: {
+                            onLevelChange(level)
+                        }) {
+                            Text(level.displayName)
+                                .font(DesignSystem.Typography.body)
+                                .fontWeight(.medium)
+                                .foregroundColor(currentLevel == level ? .white : DesignSystem.Colors.text)
+                                .padding(.horizontal, DesignSystem.Spacing.md)
+                                .padding(.vertical, DesignSystem.Spacing.sm)
+                                .background(
+                                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                        .fill(currentLevel == level ? eventType.color : DesignSystem.Colors.background)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                        .stroke(eventType.color.opacity(0.3), lineWidth: 1)
+                                )
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+                    
+                    Spacer()
+                }
+            }
+        }
+    }
+    
+    private func getDescriptionFor(eventType: String, level: SensitivityLevel) -> String {
+        switch eventType {
+        case "braking":
+            switch level {
+            case .low: return "Only detects firm stops (>0.3g deceleration) - Reduced DQI impact"
+            case .medium: return "Normal braking events (>0.2g deceleration) - Balanced detection"  
+            case .high: return "Gentle slowdowns (>0.15g deceleration) - More sensitive"
+            }
+        case "hardBraking":
+            switch level {
+            case .low: return "Emergency stops only (>0.7g deceleration) - Critical events"
+            case .medium: return "Forceful braking (>0.5g deceleration) - Standard threshold"
+            case .high: return "Sudden braking (>0.35g deceleration) - Enhanced detection"
+            }
+        case "acceleration":
+            switch level {
+            case .low: return "Rapid acceleration only (>0.3g acceleration) - Minimal penalty"
+            case .medium: return "Quick starts (>0.2g acceleration) - Baseline detection"
+            case .high: return "Gentle acceleration (>0.15g acceleration) - More sensitive"
+            }
+        case "sharpTurn":
+            switch level {
+            case .low: return "Sharp cornering only (>0.4g lateral) - DEFAULT - Higher scores"
+            case .medium: return "Quick lane changes (>0.3g lateral) - Standard detection"
+            case .high: return "Gentle steering (>0.2g lateral) - More sensitive"
+            }
+        case "roughRoad":
+            switch level {
+            case .low: return "Major potholes only (>0.7g bumps) - Reduced DQI impact"
+            case .medium: return "Uneven surfaces (>0.5g bumps) - Balanced detection"
+            case .high: return "Road irregularities (>0.35g bumps) - More sensitive"
+            }
+        case "horn":
+            switch level {
+            case .low: return "Loud, prolonged horn sounds only"
+            case .medium: return "Clear horn sounds in vicinity"
+            case .high: return "Distant or brief horn sounds"
+            }
+        case "siren":
+            switch level {
+            case .low: return "Emergency vehicles very close by"
+            case .medium: return "Sirens within reasonable distance"
+            case .high: return "Distant emergency vehicle sounds"
+            }
+        default:
+            return level.description
+        }
+    }
+}
+
 
 #Preview {
     ContentView()
