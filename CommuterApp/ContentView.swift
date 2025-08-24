@@ -1216,7 +1216,7 @@ class SensorManager: ObservableObject {
         }
         
         motionManager.startDeviceMotionUpdates(to: .main) { [weak self] motion, error in
-            if let error = error {
+            if error != nil {
                 return
             }
             
@@ -1245,7 +1245,7 @@ class SensorManager: ObservableObject {
         
         if CMAltimeter.isRelativeAltitudeAvailable() {
             altimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] altitudeData, error in
-                if let error = error {
+                if error != nil {
                     return
                 }
                 
@@ -2264,7 +2264,7 @@ class CommuteTracker: ObservableObject {
         
         // Test encoding the commute before adding to array
         do {
-            let testData = try JSONEncoder().encode([commute])
+            _ = try JSONEncoder().encode([commute])
         } catch {
             return // Don't save if we can't encode
         }
@@ -2538,7 +2538,7 @@ class CommuteTracker: ObservableObject {
         let timeFormatter = DateFormatter()
         timeFormatter.dateFormat = "HH:mm"
         
-        for (index, line) in dataLines.enumerated() {
+        for (_, line) in dataLines.enumerated() {
             do {
                 let columns = parseCSVLine(line)
                 
@@ -2782,9 +2782,9 @@ class CommuteTracker: ObservableObject {
     private func saveCommutes() {
         
         // Test each commute individually to find the problematic one
-        for (index, commute) in commutes.enumerated() {
+        for (_, commute) in commutes.enumerated() {
             do {
-                let testData = try JSONEncoder().encode(commute)
+                _ = try JSONEncoder().encode(commute)
             } catch {
                 return // Don't proceed if any commute can't be encoded
             }
@@ -2856,13 +2856,13 @@ class CommuteTracker: ObservableObject {
             }
             
             
-        } catch let DecodingError.keyNotFound(key, context) {
+        } catch DecodingError.keyNotFound(_, _) {
             clearCorruptedData()
-        } catch let DecodingError.typeMismatch(type, context) {
+        } catch DecodingError.typeMismatch(_, _) {
             clearCorruptedData()
-        } catch let DecodingError.valueNotFound(type, context) {
+        } catch DecodingError.valueNotFound(_, _) {
             clearCorruptedData()
-        } catch let DecodingError.dataCorrupted(context) {
+        } catch DecodingError.dataCorrupted(_) {
             clearCorruptedData()
         } catch {
             clearCorruptedData()
@@ -2918,7 +2918,7 @@ class CommuteTracker: ObservableObject {
             
             // Compress the data to reduce file size
             let compressedData = try (jsonData as NSData).compressed(using: .lzfse)
-            let compressionRatio = Double(compressedData.count) / Double(jsonData.count)
+            _ = Double(compressedData.count) / Double(jsonData.count)
             
             
             return compressedData as Data
@@ -4146,7 +4146,7 @@ struct ContentView: View {
         if let jsonObject = try? JSONSerialization.jsonObject(with: data),
            let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject, options: .prettyPrinted),
            let jsonString = String(data: jsonData, encoding: .utf8) {
-            let preview = String(jsonString.prefix(200))
+            _ = String(jsonString.prefix(200))
         }
         
         if commuteTracker.importData(data, tripManager: tripManager) {
@@ -5172,7 +5172,7 @@ struct ContentView: View {
         // Calculate actual statistics from filtered commutes (already guarded by isEmpty check above)
         let totalDuration = filteredCommutes.reduce(0) { $0 + $1.duration }
         let avgDuration = totalDuration / Double(filteredCommutes.count)
-        let avgScore = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.drivingScore }) / Double(filteredCommutes.count)
+        _ = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.drivingScore }) / Double(filteredCommutes.count)
         let totalTrafficTime = filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.slowTrafficTime }
         let avgTrafficTime = totalTrafficTime / Double(filteredCommutes.count)
         let avgSpeed = filteredCommutes.reduce(0.0) { $0 + $1.drivingMetrics.averageSpeed } / Double(filteredCommutes.count)
