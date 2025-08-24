@@ -5,6 +5,17 @@ import UIKit
 import MapKit
 import Charts
 
+// MARK: - Utility Functions
+extension DispatchQueue {
+    static func safeAsync(on queue: DispatchQueue = .main, _ work: @escaping @Sendable () -> Void) {
+        if queue == .main && Thread.isMainThread {
+            work()
+        } else {
+            queue.async(execute: work)
+        }
+    }
+}
+
 // MARK: - Design System
 struct DesignSystem {
     // Colors
@@ -21,7 +32,7 @@ struct DesignSystem {
         static let secondaryText = Color.secondary
         static let borderColor = Color(.systemGray4)
         
-        // Driving score colors
+        // DQI (Drive Quality Index) colors
         static let excellent = Color.green
         static let good = Color.blue
         static let fair = Color.orange
@@ -338,6 +349,7 @@ class SettingsManager: ObservableObject {
     @Published var speedLimitThreshold: Double = 80.0 // km/h
     @Published var keepScreenOn: Bool = true // Keep screen on during trips
     @Published var useLocationBasedOrdering: Bool = true // Order trips by location relevance
+    @Published var autoEndTimeHours: Double = 4.0 // Hours to wait before auto-ending stable trips
     
     // Sensor preferences for new trips
     @Published var enableGPS: Bool = true // Enable GPS tracking
@@ -348,6 +360,7 @@ class SettingsManager: ObservableObject {
     private let speedLimitKey = "SpeedLimitThreshold"
     private let keepScreenOnKey = "KeepScreenOn"
     private let locationOrderingKey = "UseLocationBasedOrdering"
+    private let autoEndTimeKey = "AutoEndTimeHours"
     private let enableGPSKey = "EnableGPS"
     private let enableMotionSensorsKey = "EnableMotionSensors"
     private let enableMicrophoneKey = "EnableMicrophone"
@@ -365,6 +378,11 @@ class SettingsManager: ObservableObject {
         keepScreenOn = userDefaults.object(forKey: keepScreenOnKey) as? Bool ?? true
         useLocationBasedOrdering = userDefaults.object(forKey: locationOrderingKey) as? Bool ?? true
         
+        let savedAutoEndTime = userDefaults.double(forKey: autoEndTimeKey)
+        if savedAutoEndTime > 0 {
+            autoEndTimeHours = savedAutoEndTime
+        }
+        
         // Load sensor preferences (default to enabled)
         enableGPS = userDefaults.object(forKey: enableGPSKey) as? Bool ?? true
         enableMotionSensors = userDefaults.object(forKey: enableMotionSensorsKey) as? Bool ?? true
@@ -373,6 +391,7 @@ class SettingsManager: ObservableObject {
     }
     
     func saveSpeedLimit(_ limit: Double) {
+        guard limit >= 30 && limit <= 150 && limit.isFinite else { return }
         speedLimitThreshold = limit
         userDefaults.set(limit, forKey: speedLimitKey)
         userDefaults.synchronize()  // Enable iCloud sync
@@ -387,6 +406,13 @@ class SettingsManager: ObservableObject {
     func saveLocationOrdering(_ useLocationOrdering: Bool) {
         useLocationBasedOrdering = useLocationOrdering
         userDefaults.set(useLocationOrdering, forKey: locationOrderingKey)
+        userDefaults.synchronize()  // Enable iCloud sync
+    }
+    
+    func saveAutoEndTime(_ hours: Double) {
+        guard hours >= 1.0 && hours <= 12.0 && hours.isFinite else { return }
+        autoEndTimeHours = hours
+        userDefaults.set(hours, forKey: autoEndTimeKey)
         userDefaults.synchronize()  // Enable iCloud sync
     }
     
@@ -425,6 +451,12 @@ struct DrivingMetrics: Codable {
     var phoneDistractions: Int = 0 // Phone interaction events (touches + orientation changes)
     var hornEvents: Int = 0 // Number of horn detections
     var sirenEvents: Int = 0 // Number of siren detections
+    
+    // Rolling average properties for improved DQI calculation
+    private var eventHistory: [(timestamp: Date, eventType: String)] = []
+    private var goodBehaviorSegments: Int = 0 // Number of 30-second segments with no events
+    private var totalSegments: Int = 0 // Total 30-second segments elapsed
+    private var segmentStartTime: Date?
     
     // Custom CodingKeys for backward compatibility
     private enum CodingKeys: String, CodingKey {
@@ -487,21 +519,91 @@ struct DrivingMetrics: Codable {
     // Default initializer
     init() {
         // All properties already have default values
+        segmentStartTime = Date()
+    }
+    
+    // Track events for averaged DQI calculation
+    mutating func addEvent(_ eventType: String) {
+        eventHistory.append((timestamp: Date(), eventType: eventType))
+        updateSegmentTracking()
+    }
+    
+    // Update segment tracking for good behavior
+    mutating func updateSegmentTracking() {
+        guard let startTime = segmentStartTime else { return }
+        let now = Date()
+        
+        // Check if we've completed a 30-second segment
+        if now.timeIntervalSince(startTime) >= 30.0 {
+            totalSegments += 1
+            
+            // Check if this segment had any events
+            let segmentEvents = eventHistory.filter { $0.timestamp >= startTime && $0.timestamp < now }
+            if segmentEvents.isEmpty {
+                goodBehaviorSegments += 1
+            }
+            
+            // Start new segment
+            segmentStartTime = now
+        }
     }
     
     var drivingScore: Int {
-        let baseScore = 100
-        let brakingPenalty = min(brakingEventCount * 2, 20)
-        let hardBrakingPenalty = min(hardBrakingEventCount * 3, 10)
-        let roughRoadPenalty = min(Int(Double(roughRoadEvents) * 0.5), 5)
-        let sharpTurnPenalty = min(sharpTurns * 3, 15)
-        let speedViolationPenalty = min(speedViolations * 4, 25)
-        let accelerationPenalty = min(accelerationEvents * 2, 15) // 2 points per acceleration event, max 15
-        let distractionPenalty = min(phoneDistractions * 3, 20) // 3 points per distraction, max 20
-        let hornPenalty = min(hornEvents * 1, 10) // 1 point per horn event, max 10
-        let slowTrafficPenalty = min(Int(slowTrafficTime / 180.0) * 2, 10) // 2 points per 3-minute block in slow traffic, max 10
+        // Passenger comfort and ride enjoyability scoring system
         
-        return max(baseScore - brakingPenalty - hardBrakingPenalty - roughRoadPenalty - sharpTurnPenalty - speedViolationPenalty - accelerationPenalty - distractionPenalty - hornPenalty - slowTrafficPenalty, 0)
+        // Base score starts at 100
+        var score: Double = 100.0
+        
+        // Calculate comfort-affecting events (reduced weight for acceleration)
+        let discomfortEvents = brakingEventCount + hardBrakingEventCount + roughRoadEvents + 
+                              sharpTurns + speedViolations + phoneDistractions + 
+                              hornEvents + sirenEvents + (accelerationEvents / 3) // Acceleration counts much less
+        
+        // If no segments yet (very short trip), use comfort-focused calculation
+        guard totalSegments > 0 else {
+            // Passenger comfort penalties - focus on jarring/uncomfortable events
+            let brakingPenalty = min(Double(brakingEventCount) * 1.2, 10.0) // Braking is uncomfortable
+            let hardBrakingPenalty = min(Double(hardBrakingEventCount) * 3.0, 12.0) // Hard braking very uncomfortable
+            let roughRoadPenalty = min(Double(roughRoadEvents) * 1.0, 8.0) // Bumps are uncomfortable - increased weight
+            let sharpTurnPenalty = min(Double(sharpTurns) * 1.2, 8.0) // Sharp turns can be uncomfortable
+            let speedViolationPenalty = min(Double(speedViolations) * 1.0, 8.0) // Speeding can be stressful
+            let accelerationPenalty = min(Double(accelerationEvents) * 0.2, 2.0) // Smooth acceleration is fine - minimal penalty
+            let distractionPenalty = min(Double(phoneDistractions) * 1.8, 10.0) // Distracted driving affects safety/comfort
+            let hornPenalty = min(Double(hornEvents) * 1.0, 8.0) // Horn noise is annoying - increased weight
+            let slowTrafficPenalty = min(slowTrafficTime / 180.0 * 2.5, 15.0) // Traffic is very frustrating - increased weight
+            
+            return Int(max(score - brakingPenalty - hardBrakingPenalty - roughRoadPenalty - sharpTurnPenalty - speedViolationPenalty - accelerationPenalty - distractionPenalty - hornPenalty - slowTrafficPenalty, 0))
+        }
+        
+        // Averaged passenger comfort scoring system
+        let comfortableRatio = totalSegments > 0 ? Double(goodBehaviorSegments) / Double(totalSegments) : 0.0
+        
+        // Calculate comfort-affecting event rate per segment
+        let avgDiscomfortPerSegment = totalSegments > 0 ? Double(discomfortEvents) / Double(totalSegments) : 0.0
+        
+        // Score based on comfortable segments (75% weight) and discomfort frequency (25% weight)
+        let comfortScore = comfortableRatio * 75.0 // 0-75 points for comfortable segments
+        let discomfortScore = max(0, 25.0 - (avgDiscomfortPerSegment * 6.0)) // 0-25 points, deduct 6 per avg discomfort event
+        
+        score = comfortScore + discomfortScore
+        
+        // Safety check for invalid mathematical results
+        if !score.isFinite {
+            score = 0.0
+        }
+        
+        // Apply penalties for highly uncomfortable events but allow recovery
+        let majorDiscomfortPenalties = min(Double(hardBrakingEventCount) * 1.5, 8.0) + // Hard braking very jarring
+                                      min(Double(roughRoadEvents) * 0.8, 6.0) + // Bumpy roads uncomfortable
+                                      min(Double(hornEvents + sirenEvents) * 1.2, 8.0) + // Noise pollution
+                                      min(slowTrafficTime / 120.0 * 2.0, 12.0) // Traffic frustration
+        
+        score -= majorDiscomfortPenalties
+        
+        // Ensure score stays in valid range
+        score = max(min(score, 100.0), 0.0)
+        
+        return Int(score.rounded())
     }
     
     var qualityDescription: String {
@@ -555,10 +657,19 @@ struct HeavyTrafficPeriod: Codable {
     }
     
     var formattedDuration: String {
-        let minutes = Int(duration / 60)
+        let totalMinutes = Int(duration / 60)
         let seconds = Int(duration.truncatingRemainder(dividingBy: 60))
-        if minutes > 0 {
-            return "\(minutes)m \(seconds)s"
+        
+        if totalMinutes >= 60 {
+            let hours = totalMinutes / 60
+            let minutes = totalMinutes % 60
+            if minutes > 0 {
+                return "\(hours)hr \(minutes)min"
+            } else {
+                return "\(hours)hr"
+            }
+        } else if totalMinutes > 0 {
+            return "\(totalMinutes)min \(seconds)s"
         } else {
             return "\(seconds)s"
         }
@@ -670,7 +781,7 @@ struct DrivingEvent: Codable, Identifiable {
     }
 }
 
-struct CommuteRecord: Codable, Identifiable {
+struct CommuteRecord: Codable, Identifiable, Hashable {
     let id: UUID
     let type: CommuteType
     let startTime: Date
@@ -723,6 +834,22 @@ struct CommuteRecord: Codable, Identifiable {
         self.drivingEvents = drivingEvents
     }
     
+    // Initializer that preserves the existing ID (for renaming)
+    init(id: UUID, type: CommuteType, startTime: Date, endTime: Date, duration: TimeInterval, drivingMetrics: DrivingMetrics, startLocation: LocationPoint?, endLocation: LocationPoint?, pathPoints: [LocationPoint], totalDistance: Double, heavyTrafficPeriods: [HeavyTrafficPeriod], drivingEvents: [DrivingEvent]) {
+        self.id = id
+        self.type = type
+        self.startTime = startTime
+        self.endTime = endTime
+        self.duration = duration
+        self.drivingMetrics = drivingMetrics
+        self.startLocation = startLocation
+        self.endLocation = endLocation
+        self.pathPoints = pathPoints
+        self.totalDistance = totalDistance
+        self.heavyTrafficPeriods = heavyTrafficPeriods
+        self.drivingEvents = drivingEvents
+    }
+    
     // Static formatters to avoid repeated creation
     static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -739,8 +866,19 @@ struct CommuteRecord: Codable, Identifiable {
     }()
     
     var formattedDuration: String {
-        let minutes = Int(duration / 60)
-        return "\(minutes) min"
+        let totalMinutes = Int(duration / 60)
+        
+        if totalMinutes >= 60 {
+            let hours = totalMinutes / 60
+            let minutes = totalMinutes % 60
+            if minutes > 0 {
+                return "\(hours)hr \(minutes)min"
+            } else {
+                return "\(hours)hr"
+            }
+        } else {
+            return "\(totalMinutes)min"
+        }
     }
     
     var formattedStartTime: String {
@@ -749,6 +887,15 @@ struct CommuteRecord: Codable, Identifiable {
     
     var formattedDate: String {
         return Self.dateFormatter.string(from: startTime)
+    }
+    
+    // MARK: - Hashable
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+    
+    static func == (lhs: CommuteRecord, rhs: CommuteRecord) -> Bool {
+        return lhs.id == rhs.id
     }
 }
 
@@ -844,6 +991,27 @@ enum CSVImportResult {
     case failure(String)
 }
 
+enum TripSortOption: String, CaseIterable {
+    case chronological = "Chronological"
+    case dqi = "DQI Score"
+    case duration = "Duration"
+    case tripName = "Trip Name"
+    
+    var icon: String {
+        switch self {
+        case .chronological: return "calendar"
+        case .dqi: return "speedometer"
+        case .duration: return "clock"
+        case .tripName: return "textformat.abc"
+        }
+    }
+}
+
+enum SortDirection {
+    case ascending
+    case descending
+}
+
 // MARK: - Trip Manager
 class TripManager: ObservableObject {
     @Published var availableTrips: [CommuteType] = []
@@ -903,11 +1071,29 @@ class TripManager: ObservableObject {
     }
     
     func updateTrip(tripId: String, newName: String) {
+        print("🔍 TripManager.updateTrip called with id: \(tripId), newName: \(newName)")
+        print("📋 Available trips in TripManager:")
+        for trip in availableTrips {
+            print("   - ID: '\(trip.id)', Name: '\(trip.displayName)', isOneOff: \(trip.isOneOff)")
+        }
+        
         if let index = availableTrips.firstIndex(where: { $0.id == tripId }) {
             let trip = availableTrips[index]
+            print("📝 Found trip at index \(index): \(trip.displayName) -> \(newName)")
             // All trips are now treated as custom after first launch
             availableTrips[index] = CommuteType(id: trip.id, displayName: newName, isDefault: false, isOneOff: trip.isOneOff)
             saveTrips()
+            print("💾 Trip updated and saved")
+        } else {
+            print("❌ Trip not found with id: \(tripId)")
+            print("🔍 Searched for ID: '\(tripId)'")
+            
+            // Create the missing trip type (this can happen with imported data or deleted trips)
+            print("🛠️ Creating missing trip type with ID: \(tripId)")
+            let newTrip = CommuteType(id: tripId, displayName: newName, isDefault: false, isOneOff: false)
+            availableTrips.append(newTrip)
+            saveTrips()
+            print("✅ Missing trip created and renamed to: \(newName)")
         }
     }
     
@@ -989,7 +1175,7 @@ class SensorManager: ObservableObject {
     @Published var isMotionAvailable = false
     
     private var accelerationHistory: [CMAcceleration] = []
-    private let maxHistorySize = 100
+    private let maxHistorySize = 50 // Reduced for better performance
     private var lastAccelerationEventTime: Date?
     private var lastDistractionEventTime: Date?
     
@@ -1092,6 +1278,9 @@ class SensorManager: ObservableObject {
         
         let recentAccelerations = Array(accelerationHistory.suffix(5))
         
+        // Defensive check against empty array to prevent divide by zero
+        guard !recentAccelerations.isEmpty else { return (false, false, 0) }
+        
         // Calculate forward/backward acceleration (X-axis) and lateral acceleration (Y-axis)
         let avgForwardDeceleration = recentAccelerations.reduce(0) { $0 + $1.x } / Double(recentAccelerations.count)
         let avgLateralAcceleration = recentAccelerations.reduce(0) { $0 + abs($1.y) } / Double(recentAccelerations.count)
@@ -1113,6 +1302,9 @@ class SensorManager: ObservableObject {
         let recentAccelerations = Array(accelerationHistory.suffix(15)) // 3 seconds of data
         let verticalValues = recentAccelerations.map { $0.z }
         
+        // Defensive check against empty array to prevent divide by zero
+        guard !verticalValues.isEmpty else { return false }
+        
         // Calculate both variance and peak-to-peak amplitude for better detection
         let mean = verticalValues.reduce(0, +) / Double(verticalValues.count)
         let variance = verticalValues.reduce(0) { $0 + pow($1 - mean, 2) } / Double(verticalValues.count)
@@ -1122,7 +1314,7 @@ class SensorManager: ObservableObject {
         let minValue = verticalValues.min() ?? 0
         let peakToPeak = maxValue - minValue
         
-        return variance > 0.2 || peakToPeak > 0.8 // Less sensitive to avoid false positives on minor bumps
+        return variance > 0.1 || peakToPeak > 0.5 // More sensitive to catch rougher road conditions
     }
     
     func detectSharpTurn() -> Bool {
@@ -1134,11 +1326,15 @@ class SensorManager: ObservableObject {
         
         // Check recent lateral acceleration to complement gyroscope data
         let recentAccelerations = Array(accelerationHistory.suffix(3))
+        
+        // Defensive check against empty array to prevent divide by zero
+        guard !recentAccelerations.isEmpty else { return false }
+        
         let avgLateralAcceleration = recentAccelerations.reduce(0) { $0 + abs($1.y) } / Double(recentAccelerations.count)
         
-        // Detect even moderate cornering (much more sensitive)
-        let isSharpRotation = rotationMagnitude > 0.6 // Reduced from 1.2 to catch lighter turns
-        let isHighLateralForce = avgLateralAcceleration > 0.25 // Reduced from 0.5 to catch gentler cornering
+        // Detect only more significant cornering (less sensitive)
+        let isSharpRotation = rotationMagnitude > 1.0 // Increased threshold to reduce false positives  
+        let isHighLateralForce = avgLateralAcceleration > 0.4 // Increased threshold to catch only sharper turns
         
         return isSharpRotation || isHighLateralForce
     }
@@ -1158,11 +1354,14 @@ class SensorManager: ObservableObject {
         
         let recentAccelerations = Array(accelerationHistory.suffix(5))
         
+        // Defensive check against empty array to prevent divide by zero
+        guard !recentAccelerations.isEmpty else { return false }
+        
         // Calculate forward acceleration (positive X-axis indicates acceleration)
         let avgForwardAcceleration = recentAccelerations.reduce(0) { $0 + $1.x } / Double(recentAccelerations.count)
         
         // Detect even light acceleration events (positive forward acceleration)
-        let isAccelerating = avgForwardAcceleration > 0.15 // More sensitive threshold for detecting acceleration
+        let isAccelerating = avgForwardAcceleration > 0.08 // Even more sensitive threshold for detecting acceleration
         
         if isAccelerating {
             lastAccelerationEventTime = now
@@ -1302,7 +1501,7 @@ class SensorManager: ObservableObject {
         let compensatedZ = filteredZ
         
         // If vehicle is on an incline, adjust forward/backward acceleration
-        if gravityMagnitude > 0.8 { // Reasonable gravity magnitude
+        if gravityMagnitude > 0.8 && gravityMagnitude.isFinite { // Reasonable gravity magnitude and valid
             let tiltFactor = abs(gravity.x) / gravityMagnitude
             compensatedX = filteredX * (1.0 + tiltFactor * 0.1) // Small compensation
         }
@@ -1736,6 +1935,7 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
     }
     
+    
     func startLocationUpdates() {
         // Always initialize tracking state regardless of permissions
         isTracking = true
@@ -1846,9 +2046,10 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
                 )
                 self.pathPoints.append(newPoint)
                 
-                // Limit path points to prevent memory issues (keep last 1000 points)
-                if self.pathPoints.count > 1000 {
-                    self.pathPoints.removeFirst()
+                // Limit path points to prevent memory issues (keep last 800 points for production)
+                if self.pathPoints.count > 800 {
+                    // Remove multiple points at once for better performance
+                    self.pathPoints.removeFirst(min(50, self.pathPoints.count - 800))
                 }
             }
             
@@ -1861,6 +2062,11 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
                     if location.verticalAccuracy <= 20.0 && lastLocation.verticalAccuracy <= 20.0 {
                         let elevationChange = abs(location.altitude - lastLocation.altitude)
                         totalDistance3D = sqrt(pow(horizontalDistance, 2) + pow(elevationChange, 2))
+                        
+                        // Safety check for invalid mathematical results
+                        if !totalDistance3D.isFinite {
+                            totalDistance3D = horizontalDistance
+                        }
                     }
                     
                     self.totalDistance += totalDistance3D
@@ -1944,6 +2150,8 @@ class CommuteTracker: ObservableObject {
     private var lastSpeedViolationTime: Date?
     private var _slowTrafficStartTime: Date?
     @Published var isCurrentlyInSlowTraffic = false
+    private var tripStartTime: Date?
+    private let gracePeriodDuration: TimeInterval = 8.0 // 8 seconds grace period
     
     var slowTrafficStartTime: Date? {
         return _slowTrafficStartTime
@@ -1962,7 +2170,9 @@ class CommuteTracker: ObservableObject {
     }
     
     func startCommute(type: CommuteType, sensorManager: SensorManager, locationManager: LocationManager, settingsManager: SettingsManager) {
-        activeCommute = (type: type, startTime: Date())
+        let startTime = Date()
+        activeCommute = (type: type, startTime: startTime)
+        tripStartTime = startTime // Set grace period start
         currentMetrics = DrivingMetrics()
         self.sensorManager = sensorManager
         self.locationManager = locationManager
@@ -1972,6 +2182,12 @@ class CommuteTracker: ObservableObject {
         self.isCurrentlyInSlowTraffic = false
         
         startMetricsCollection()
+    }
+    
+    // Helper method to check if we're still in the grace period
+    func isInGracePeriod() -> Bool {
+        guard let startTime = tripStartTime else { return false }
+        return Date().timeIntervalSince(startTime) < gracePeriodDuration
     }
     
     func stopCommute(onCompletion: ((UUID) -> Void)? = nil) {
@@ -2027,6 +2243,7 @@ class CommuteTracker: ObservableObject {
             
             self.commutes.insert(commute, at: 0)
             self.activeCommute = nil
+            self.tripStartTime = nil // Clear grace period timer
             self.currentMetrics = DrivingMetrics()
             self.currentDrivingEvents = [] // Reset driving events for next trip
             
@@ -2072,8 +2289,10 @@ class CommuteTracker: ObservableObject {
         switch event.type {
         case .horn:
             currentMetrics.hornEvents += 1
+            currentMetrics.addEvent("horn")
         case .siren:
             currentMetrics.sirenEvents += 1
+            currentMetrics.addEvent("siren")
         default:
             break
         }
@@ -2085,6 +2304,15 @@ class CommuteTracker: ObservableObject {
               let locationManager = locationManager,
               let settingsManager = settingsManager else { return }
         
+        // Skip event detection during grace period to avoid phone placement being counted
+        if isInGracePeriod() {
+            // Still update basic location metrics but skip driving event detection
+            currentMetrics.maxSpeed = locationManager.maxSpeed
+            currentMetrics.averageSpeed = locationManager.averageSpeed
+            currentMetrics.totalDistance = locationManager.totalDistance
+            return
+        }
+        
         // Get current location for event recording
         let currentLocation = locationManager.currentLocation
         
@@ -2092,6 +2320,7 @@ class CommuteTracker: ObservableObject {
         let brakingResult = sensorManager.detectBrakingEvent()
         if brakingResult.isBraking {
             currentMetrics.brakingEventCount += 1
+            currentMetrics.addEvent("braking")
             
             // Store event with location
             if let location = currentLocation {
@@ -2113,11 +2342,13 @@ class CommuteTracker: ObservableObject {
             
             if brakingResult.isHardBraking {
                 currentMetrics.hardBrakingEventCount += 1
+                currentMetrics.addEvent("hardBraking")
             }
         }
         
         if sensorManager.detectRoughRoad() {
             currentMetrics.roughRoadEvents += 1
+            currentMetrics.addEvent("roughRoad")
             
             // Store rough road event
             if let location = currentLocation {
@@ -2139,6 +2370,7 @@ class CommuteTracker: ObservableObject {
         
         if sensorManager.detectSharpTurn() {
             currentMetrics.sharpTurns += 1
+            currentMetrics.addEvent("sharpTurn")
             
             // Store sharp turn event
             if let location = currentLocation {
@@ -2161,6 +2393,7 @@ class CommuteTracker: ObservableObject {
         // Acceleration event detection
         if sensorManager.detectAccelerationEvent() {
             currentMetrics.accelerationEvents += 1
+            currentMetrics.addEvent("acceleration")
             
             // Store acceleration event
             if let location = currentLocation {
@@ -2183,6 +2416,7 @@ class CommuteTracker: ObservableObject {
         // Phone distraction detection
         if sensorManager.detectPhoneDistraction() {
             currentMetrics.phoneDistractions += 1
+            currentMetrics.addEvent("phoneDistraction")
             
             // Store phone distraction event
             if let location = currentLocation {
@@ -2206,13 +2440,15 @@ class CommuteTracker: ObservableObject {
         if sensorManager.detectSpeedViolation(currentSpeed: locationManager.currentSpeed, speedLimit: settingsManager.speedLimitThreshold) {
             let now = Date()
             if let lastViolation = lastSpeedViolationTime {
-                // Reduced cooldown to 5 seconds - better balance between accuracy and spam prevention
-                if now.timeIntervalSince(lastViolation) > 5.0 {
+                // Extended cooldown to 15 seconds to prevent excessive penalties for sustained speeding
+                if now.timeIntervalSince(lastViolation) > 15.0 {
                     currentMetrics.speedViolations += 1
+                    currentMetrics.addEvent("speedViolation")
                     lastSpeedViolationTime = now
                 }
             } else {
                 currentMetrics.speedViolations += 1
+                currentMetrics.addEvent("speedViolation")
                 lastSpeedViolationTime = now
             }
         }
@@ -2241,11 +2477,14 @@ class CommuteTracker: ObservableObject {
             }
         }
         
+        // Update segment tracking for averaged DQI calculation
+        currentMetrics.updateSegmentTracking()
+        
         // Remove expensive acceleration event storage - not needed for metrics
     }
     
     func exportToCSV() -> String {
-        var csvContent = "Date,Type,Start Time,End Time,Duration (minutes),Driving Score,Quality,Braking Events,Hard Braking,Max Speed (km/h),Average Speed (km/h),Distance (m),Rough Road Events,Sharp Turns,Speed Violations,Acceleration Events,Phone Distractions,Horn Events,Siren Events,Slow Traffic Time (min),Slow Traffic %,Start Latitude,Start Longitude,End Latitude,End Longitude,Path Points Count,Heavy Traffic Periods,Total Heavy Traffic Duration (min)\n"
+        var csvContent = "Date,Type,Start Time,End Time,Duration (minutes),DQI - Passenger Comfort Index,Quality,Braking Events,Hard Braking,Max Speed (km/h),Average Speed (km/h),Distance (m),Rough Road Events,Sharp Turns,Speed Violations,Acceleration Events,Phone Distractions,Horn Events,Siren Events,Slow Traffic Time (min),Slow Traffic %,Start Latitude,Start Longitude,End Latitude,End Longitude,Path Points Count,Heavy Traffic Periods,Total Heavy Traffic Duration (min)\n"
         
         // Use shared formatters from CommuteRecord
         for commute in commutes.reversed() {
@@ -2370,8 +2609,8 @@ class CommuteTracker: ObservableObject {
         let regex = try? NSRegularExpression(pattern: datePattern)
         
         var processedLine = line
-        if let match = regex?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
-            let dateRange = Range(match.range(at: 1), in: line)!
+        if let match = regex?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+           let dateRange = Range(match.range(at: 1), in: line) {
             let datePart = String(line[dateRange])
             // Replace commas in the date with a placeholder
             let quotedDate = "\"\(datePart)\""
@@ -2813,7 +3052,7 @@ class CommuteTracker: ObservableObject {
                     let duration = pathPoints[endIndex].timestamp.timeIntervalSince(pathPoints[startIndex].timestamp)
                     
                     // Only count as heavy traffic if sustained for at least 1 minute
-                    if duration >= minimumDuration {
+                    if duration >= minimumDuration && !slowPeriodSpeeds.isEmpty {
                         let averageSpeed = slowPeriodSpeeds.reduce(0, +) / Double(slowPeriodSpeeds.count)
                         
                         let period = HeavyTrafficPeriod(
@@ -2839,7 +3078,7 @@ class CommuteTracker: ObservableObject {
             let endIndex = pathPoints.count - 1
             let duration = pathPoints[endIndex].timestamp.timeIntervalSince(pathPoints[startIndex].timestamp)
             
-            if duration >= minimumDuration {
+            if duration >= minimumDuration && !slowPeriodSpeeds.isEmpty {
                 let averageSpeed = slowPeriodSpeeds.reduce(0, +) / Double(slowPeriodSpeeds.count)
                 
                 let period = HeavyTrafficPeriod(
@@ -2885,10 +3124,48 @@ class CommuteTracker: ObservableObject {
         
         return insights
     }
+    
+    func renameOneOffTrip(commuteId: UUID, newName: String) {
+        print("🔄 CommuteTracker.renameOneOffTrip called for ID: \(commuteId)")
+        if let index = commutes.firstIndex(where: { $0.id == commuteId }) {
+            let commute = commutes[index]
+            if commute.type.isOneOff {
+                print("📝 Updating one-off trip name: '\(commute.type.displayName)' -> '\(newName)'")
+                let updatedType = CommuteType(id: commute.type.id, displayName: newName, isDefault: false, isOneOff: true)
+                
+                // Create a new commute record with the updated type
+                let updatedCommute = CommuteRecord(
+                    id: commute.id,
+                    type: updatedType,
+                    startTime: commute.startTime,
+                    endTime: commute.endTime,
+                    duration: commute.duration,
+                    drivingMetrics: commute.drivingMetrics,
+                    startLocation: commute.startLocation,
+                    endLocation: commute.endLocation,
+                    pathPoints: commute.pathPoints,
+                    totalDistance: commute.totalDistance,
+                    heavyTrafficPeriods: commute.heavyTrafficPeriods,
+                    drivingEvents: commute.drivingEvents
+                )
+                
+                commutes[index] = updatedCommute
+                saveCommutes()
+                print("💾 One-off trip renamed and saved")
+            } else {
+                print("❌ Trip is not a one-off trip")
+            }
+        } else {
+            print("❌ Commute not found with ID: \(commuteId)")
+        }
+    }
 }
 
 // MARK: - Main Content View
 struct ContentView: View {
+    // Auto-end trip constants
+    private let autoEndTimeLimit: TimeInterval = 24 * 60 * 60 // 24 hours (absolute maximum)
+    private let stableLocationRadius: CLLocationDistance = 100 // 100 meters
     @StateObject private var locationManager = LocationManager()
     @StateObject private var commuteTracker = CommuteTracker()
     @StateObject private var sensorManager = SensorManager()
@@ -2899,12 +3176,17 @@ struct ContentView: View {
     @State private var isTracking = false
     @State private var trackingDuration: TimeInterval = 0
     @State private var timer: Timer?
+    @State private var autoEndTimer: Timer?
+    @State private var lastStableLocation: CLLocation?
+    @State private var stableLocationStartTime: Date?
     @State private var completedTripId: UUID?
     @State private var showingTripCompletion = false
     @State private var showDeleteAllAlert = false
+    @State private var historyTabSelection = 0
+    @State private var historySortOption: TripSortOption = .chronological
+    @State private var historySortDirection: SortDirection = .descending
     @State private var selectedCommuteFilter: CommuteFilterOption = .all
     @State private var showTripEditor = false
-    @State private var expandedCommuteIds: Set<UUID> = []
     @State private var showSplashScreen = true
     @State private var showOnboarding = false
     @State private var showDocumentPicker = false
@@ -2912,13 +3194,18 @@ struct ContentView: View {
     @State private var isImportingCSV = false
     @State private var importResult: ImportResult?
     @State private var csvImportResult: CSVImportResult?
+    @State private var tripDetailsCommute: CommuteRecord?
     @State private var fullScreenMapCommute: CommuteRecord?
     @State private var showDrivingEvents = true
     @State private var visibleEventTypes: Set<DrivingEvent.EventType> = Set(DrivingEvent.EventType.allCases)
-    @State private var showOneOffTripSheet = false
-    @State private var oneOffTripName = ""
     @State private var showDriveQualityExplanation = false
     @State private var showDepartureTimeExplanation = false
+    @State private var showEventFilterSheet = false
+    @State private var showRenameDialog = false
+    @State private var newTripName = ""
+    @State private var renamingCommute: CommuteRecord?
+    @State private var showDeleteTripAlert = false
+    @State private var tripToDelete: CommuteRecord?
     
     var body: some View {
         if showSplashScreen {
@@ -3111,6 +3398,32 @@ struct ContentView: View {
         .sheet(isPresented: $showDepartureTimeExplanation) {
             DepartureTimeExplanationView()
         }
+        .alert("Rename Trip", isPresented: $showRenameDialog) {
+            TextField("Enter new name", text: $newTripName)
+            Button("Cancel", role: .cancel) {
+                newTripName = ""
+                renamingCommute = nil
+            }
+            Button("Rename") {
+                print("🔘 Rename button pressed")
+                if let commute = renamingCommute, !newTripName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    print("🚀 Calling renameTrip with new name: '\(newTripName.trimmingCharacters(in: .whitespacesAndNewlines))'")
+                    renameTrip(commute, to: newTripName.trimmingCharacters(in: .whitespacesAndNewlines))
+                } else {
+                    print("❌ Rename conditions not met - commute: \(renamingCommute?.type.displayName ?? "nil"), newName: '\(newTripName)'")
+                }
+                newTripName = ""
+                renamingCommute = nil
+            }
+        } message: {
+            if let commute = renamingCommute {
+                if commute.type.isOneOff {
+                    Text("Rename this one-off trip")
+                } else {
+                    Text("This will rename all trips for this commute route")
+                }
+            }
+        }
         .overlay(
             Group {
                 if showingTripCompletion {
@@ -3146,8 +3459,8 @@ struct ContentView: View {
         // Start GPS location fetching immediately
         locationManager.requestLocationPermission()
         
-        // Hide splash screen after 2 seconds and check if onboarding is needed
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+        // Hide splash screen after 3 seconds and check if onboarding is needed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             withAnimation(.easeInOut(duration: 0.5)) {
                 showSplashScreen = false
                 // Check if user has seen onboarding
@@ -3179,7 +3492,7 @@ struct ContentView: View {
                                 Image(systemName: "stop.fill")
                                     .font(.headline)
                                 
-                                Text("Stop Commute")
+                                Text("Stop Trip")
                                     .font(.headline)
                                     .fontWeight(.semibold)
                             }
@@ -3194,7 +3507,9 @@ struct ContentView: View {
                             // One-Off Trip Section
                             VStack(spacing: 12) {
                                 Button(action: {
-                                    showOneOffTripSheet = true
+                                    let autoName = generateAutoTripName()
+                                    let oneOffTrip = tripManager.createOneOffTrip(name: autoName)
+                                    startTracking(oneOffTrip)
                                 }) {
                                     HStack {
                                         VStack(alignment: .leading, spacing: 4) {
@@ -3203,14 +3518,14 @@ struct ContentView: View {
                                                 .foregroundColor(.white)
                                                 .fontWeight(.medium)
                                             
-                                            Text("Create a one-time trip")
+                                            Text("Start tracking immediately")
                                                 .font(.caption)
                                                 .foregroundColor(.white.opacity(0.8))
                                         }
                                         
                                         Spacer()
                                         
-                                        Image(systemName: "plus.circle.fill")
+                                        Image(systemName: "play.circle.fill")
                                             .font(.title2)
                                             .foregroundColor(.white.opacity(0.9))
                                     }
@@ -3302,91 +3617,6 @@ struct ContentView: View {
                     .environmentObject(tripManager)
                     .environmentObject(commuteTracker)
             }
-            .sheet(isPresented: $showOneOffTripSheet) {
-                OneOffTripSheet(
-                    tripName: $oneOffTripName,
-                    onStart: { name in
-                        let oneOffTrip = tripManager.createOneOffTrip(name: name)
-                        startTracking(oneOffTrip)
-                        showOneOffTripSheet = false
-                        oneOffTripName = ""
-                    },
-                    onCancel: {
-                        showOneOffTripSheet = false
-                        oneOffTripName = ""
-                    }
-                )
-            }
-        }
-    }
-    
-    // MARK: - One-Off Trip Sheet
-    struct OneOffTripSheet: View {
-        @Binding var tripName: String
-        let onStart: (String) -> Void
-        let onCancel: () -> Void
-        
-        var body: some View {
-            NavigationView {
-                VStack(spacing: 24) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Create Custom Trip")
-                            .font(.title2)
-                            .fontWeight(.bold)
-                        
-                        Text("Enter a name for your one-time trip. This won't be saved to your regular trips list.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Trip Name")
-                            .font(.headline)
-                        
-                        TextField("e.g., Airport Trip, Friend's House", text: $tripName)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                            .submitLabel(.done)
-                            .onSubmit {
-                                if !tripName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    onStart(tripName.trimmingCharacters(in: .whitespacesAndNewlines))
-                                }
-                            }
-                    }
-                    
-                    Spacer()
-                    
-                    VStack(spacing: 12) {
-                        Button(action: {
-                            let trimmedName = tripName.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !trimmedName.isEmpty {
-                                onStart(trimmedName)
-                            }
-                        }) {
-                            HStack {
-                                Image(systemName: "play.circle.fill")
-                                Text("Start Trip")
-                            }
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(tripName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.gray : Color.green)
-                            .cornerRadius(12)
-                        }
-                        .disabled(tripName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        
-                        Button("Cancel") {
-                            onCancel()
-                        }
-                        .foregroundColor(.secondary)
-                    }
-                }
-                .padding()
-                .navigationTitle("Custom Trip")
-                .navigationBarTitleDisplayMode(.inline)
-                .navigationBarBackButtonHidden(true)
-            }
         }
     }
     
@@ -3398,99 +3628,119 @@ struct ContentView: View {
     func StatusCard() -> some View {
         CardView {
             if isTracking, let active = commuteTracker.activeCommute {
-                VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
-                    HStack(alignment: .top) {
-                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                            Text(active.type.displayName)
-                                .font(DesignSystem.Typography.title2)
-                                .foregroundColor(DesignSystem.Colors.text)
-                            
-                            Text("Active Trip")
-                                .font(DesignSystem.Typography.caption)
-                                .foregroundColor(DesignSystem.Colors.secondaryText)
-                        }
+                VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+                    // Header with trip name and live indicator
+                    HStack {
+                        Text(active.type.displayName)
+                            .font(DesignSystem.Typography.title3)
+                            .foregroundColor(DesignSystem.Colors.text)
+                            .fontWeight(.medium)
                         
                         Spacer()
                         
-                        VStack(alignment: .trailing, spacing: DesignSystem.Spacing.xs) {
-                            Text(formatDuration(trackingDuration))
-                                .font(DesignSystem.Typography.title3)
-                                .foregroundColor(DesignSystem.Colors.primary)
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(DesignSystem.Colors.success)
+                                .frame(width: 6, height: 6)
+                            Text("LIVE")
+                                .font(DesignSystem.Typography.caption2)
+                                .foregroundColor(DesignSystem.Colors.success)
                                 .fontWeight(.bold)
-                            
-                            HStack(spacing: DesignSystem.Spacing.xs) {
-                                Circle()
-                                    .fill(DesignSystem.Colors.success)
-                                    .frame(width: 8, height: 8)
-                                    .opacity(0.8)
-                                
-                                Text("LIVE")
-                                    .font(DesignSystem.Typography.caption2)
-                                    .foregroundColor(DesignSystem.Colors.success)
-                                    .fontWeight(.bold)
-                            }
                         }
                     }
                     
-                    if locationManager.currentSpeed > 0 {
-                        Divider()
-                            .background(DesignSystem.Colors.borderColor)
-                        
+                    // Total trip time
+                    HStack {
+                        Image(systemName: "clock")
+                            .font(.caption)
+                            .foregroundColor(DesignSystem.Colors.accent)
+                        Text("Trip Time")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                        Spacer()
+                        Text(formatDuration(trackingDuration))
+                            .font(DesignSystem.Typography.callout)
+                            .foregroundColor(DesignSystem.Colors.primary)
+                            .fontWeight(.semibold)
+                    }
+                    
+                    // Distance
+                    if locationManager.totalDistance > 0 {
                         HStack {
-                            Label {
-                                Text("\(Int(locationManager.currentSpeed)) km/h")
-                                    .font(DesignSystem.Typography.headline)
-                                    .foregroundColor(DesignSystem.Colors.text)
-                                    .fontWeight(.semibold)
-                            } icon: {
-                                Image(systemName: "speedometer")
-                                    .foregroundColor(DesignSystem.Colors.accent)
-                            }
-                            
+                            Image(systemName: "map")
+                                .font(.caption)
+                                .foregroundColor(DesignSystem.Colors.primary)
+                            Text("Distance")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
                             Spacer()
-                            
-                            if commuteTracker.currentMetrics.slowTrafficTime > 0 {
-                                Label {
-                                    Text(formatDuration(commuteTracker.currentMetrics.slowTrafficTime))
-                                        .font(DesignSystem.Typography.callout)
-                                        .foregroundColor(DesignSystem.Colors.warning)
-                                        .fontWeight(.medium)
-                                } icon: {
-                                    Image(systemName: "tortoise.fill")
-                                        .foregroundColor(DesignSystem.Colors.warning)
-                                }
-                            }
+                            Text("\(String(format: "%.1f", locationManager.totalDistance/1000)) km")
+                                .font(DesignSystem.Typography.callout)
+                                .foregroundColor(DesignSystem.Colors.text)
+                                .fontWeight(.semibold)
                         }
-                        
-                        // Phone orientation information
-                        if sensorManager.vehicleOrientation != .unknown {
-                            Divider()
-                                .background(DesignSystem.Colors.borderColor)
-                            
-                            HStack {
-                                Text(sensorManager.getOrientationDescription())
-                                    .font(DesignSystem.Typography.caption)
-                                    .foregroundColor(DesignSystem.Colors.secondaryText)
-                                
-                                Spacer()
-                                
-                                Text("Sensor calibrated")
-                                    .font(DesignSystem.Typography.caption)
-                                    .foregroundColor(DesignSystem.Colors.success)
-                            }
+                    }
+                    
+                    // Slow traffic time (second section)
+                    if commuteTracker.currentMetrics.slowTrafficTime > 0 {
+                        HStack {
+                            Image(systemName: "tortoise.fill")
+                                .font(.caption)
+                                .foregroundColor(DesignSystem.Colors.warning)
+                            Text("Slow Traffic")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                            Spacer()
+                            Text(formatDuration(commuteTracker.currentMetrics.slowTrafficTime))
+                                .font(DesignSystem.Typography.callout)
+                                .foregroundColor(DesignSystem.Colors.warning)
+                                .fontWeight(.semibold)
                         }
+                    }
+                    
+                    // Current speed (when moving)
+                    if locationManager.currentSpeed > 0 {
+                        HStack {
+                            Image(systemName: "speedometer")
+                                .font(.caption)
+                                .foregroundColor(DesignSystem.Colors.accent)
+                            Text("Current Speed")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                            Spacer()
+                            Text("\(Int(locationManager.currentSpeed)) km/h")
+                                .font(DesignSystem.Typography.callout)
+                                .foregroundColor(DesignSystem.Colors.text)
+                                .fontWeight(.semibold)
+                        }
+                    }
+                    
+                    // Sensor orientation
+                    HStack {
+                        Image(systemName: sensorManager.vehicleOrientation != .unknown ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundColor(sensorManager.vehicleOrientation != .unknown ? DesignSystem.Colors.success : DesignSystem.Colors.warning)
+                        Text("Position")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                        Spacer()
+                        Text(sensorManager.getOrientationDescription())
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(sensorManager.vehicleOrientation != .unknown ? DesignSystem.Colors.success : DesignSystem.Colors.warning)
+                            .fontWeight(.medium)
                     }
                 }
             } else {
-                VStack(spacing: DesignSystem.Spacing.md) {
+                VStack(spacing: DesignSystem.Spacing.sm) {
                     Image(systemName: "car.fill")
-                        .font(.system(size: 40))
+                        .font(.system(size: 32))
                         .foregroundColor(DesignSystem.Colors.secondaryText)
                     
-                    VStack(spacing: DesignSystem.Spacing.xs) {
+                    VStack(spacing: 2) {
                         Text("Ready to Track")
-                            .font(DesignSystem.Typography.title3)
+                            .font(DesignSystem.Typography.callout)
                             .foregroundColor(DesignSystem.Colors.text)
+                            .fontWeight(.medium)
                         
                         Text("Select a trip below to start")
                             .font(DesignSystem.Typography.caption)
@@ -3498,14 +3748,14 @@ struct ContentView: View {
                     }
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, DesignSystem.Spacing.md)
+                .padding(.vertical, DesignSystem.Spacing.sm)
             }
         }
     }
     
     func LiveMetricsCard() -> some View {
         CardView {
-            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
                         Text("Driving Metrics")
@@ -3520,58 +3770,110 @@ struct ContentView: View {
                     Spacer()
                     
                     VStack(spacing: DesignSystem.Spacing.xs) {
-                        Text("\(commuteTracker.currentMetrics.drivingScore)")
-                            .font(DesignSystem.Typography.title)
-                            .foregroundColor(.white)
-                            .fontWeight(.bold)
-                        
-                        Text("SCORE")
-                            .font(DesignSystem.Typography.caption2)
-                            .foregroundColor(.white.opacity(0.8))
-                            .fontWeight(.medium)
+                        if commuteTracker.isInGracePeriod() {
+                            Text("--")
+                                .font(DesignSystem.Typography.title)
+                                .foregroundColor(.white)
+                                .fontWeight(.bold)
+                            
+                            Text("PREPARING")
+                                .font(DesignSystem.Typography.caption2)
+                                .foregroundColor(.white.opacity(0.8))
+                                .fontWeight(.medium)
+                        } else {
+                            Text("\(commuteTracker.currentMetrics.drivingScore)")
+                                .font(DesignSystem.Typography.title)
+                                .foregroundColor(.white)
+                                .fontWeight(.bold)
+                            
+                            Text("DQI")
+                                .font(DesignSystem.Typography.caption2)
+                                .foregroundColor(.white.opacity(0.8))
+                                .fontWeight(.medium)
+                        }
                     }
                     .padding(.horizontal, DesignSystem.Spacing.md)
                     .padding(.vertical, DesignSystem.Spacing.sm)
                     .background(
                         RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
-                            .fill(scoreColor(commuteTracker.currentMetrics.drivingScore))
-                            .shadow(color: scoreColor(commuteTracker.currentMetrics.drivingScore).opacity(0.3), radius: 4, x: 0, y: 2)
+                            .fill(commuteTracker.isInGracePeriod() ? Color.gray : scoreColor(commuteTracker.currentMetrics.drivingScore))
+                            .shadow(color: (commuteTracker.isInGracePeriod() ? Color.gray : scoreColor(commuteTracker.currentMetrics.drivingScore)).opacity(0.3), radius: 4, x: 0, y: 2)
                     )
                 }
                 
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 2), spacing: DesignSystem.Spacing.md) {
-                    MetricTile(title: "Braking Events", value: "\(commuteTracker.currentMetrics.brakingEventCount)", color: DesignSystem.Colors.error)
-                    MetricTile(title: "Sharp Turns", value: "\(commuteTracker.currentMetrics.sharpTurns)", color: DesignSystem.Colors.warning)
-                    MetricTile(title: "Accelerations", value: "\(commuteTracker.currentMetrics.accelerationEvents)", color: DesignSystem.Colors.accent)
-                    MetricTile(title: "Phone Use", value: "\(commuteTracker.currentMetrics.phoneDistractions)", color: DesignSystem.Colors.error)
-                    MetricTile(title: "Horns", value: "\(commuteTracker.currentMetrics.hornEvents)", color: DesignSystem.Colors.primary)
-                    MetricTile(title: "Sirens", value: "\(commuteTracker.currentMetrics.sirenEvents)", color: DesignSystem.Colors.accent)
-                    MetricTile(title: "Rough Roads", value: "\(commuteTracker.currentMetrics.roughRoadEvents)", color: DesignSystem.Colors.speedSlow)
-                    MetricTile(title: "Speed Violations", value: "\(commuteTracker.currentMetrics.speedViolations)", color: DesignSystem.Colors.speedVeryFast)
+                // Grace period message
+                if commuteTracker.isInGracePeriod() {
+                    Text("🚗 Setting up trip monitoring...")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(.top, 4)
                 }
                 
-                SlowTrafficTimer(commuteTracker: commuteTracker)
-                
-                if locationManager.totalDistance > 0 {
-                    Divider()
-                        .background(DesignSystem.Colors.borderColor)
-                    
+                // Slow traffic section - moved to top
+                if commuteTracker.currentMetrics.slowTrafficTime > 0 || commuteTracker.isCurrentlyInSlowTraffic {
                     HStack {
-                        Label {
-                            Text("\(String(format: "%.1f", locationManager.totalDistance/1000)) km")
-                                .font(DesignSystem.Typography.headline)
-                                .foregroundColor(DesignSystem.Colors.text)
-                                .fontWeight(.semibold)
-                        } icon: {
-                            Image(systemName: "map")
-                                .foregroundColor(DesignSystem.Colors.primary)
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(commuteTracker.isCurrentlyInSlowTraffic ? Color.red : Color.orange)
+                                .frame(width: 6, height: 6)
+                            Text("Slow Traffic")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
                         }
-                        
                         Spacer()
+                        Text(formatSlowTrafficTime(commuteTracker.currentMetrics.slowTrafficTime, commuteTracker.slowTrafficStartTime))
+                            .font(DesignSystem.Typography.callout)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.orange)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.orange.opacity(0.1))
+                    )
+                }
+                
+                // Compact events table
+                VStack(spacing: 4) {
+                    // Row 1
+                    HStack(spacing: 8) {
+                        CompactMetric(title: "Braking", value: commuteTracker.currentMetrics.brakingEventCount, color: DesignSystem.Colors.error)
+                        CompactMetric(title: "Turns", value: commuteTracker.currentMetrics.sharpTurns, color: DesignSystem.Colors.warning)
+                        CompactMetric(title: "Accel", value: commuteTracker.currentMetrics.accelerationEvents, color: DesignSystem.Colors.accent)
+                        CompactMetric(title: "Phone", value: commuteTracker.currentMetrics.phoneDistractions, color: DesignSystem.Colors.error)
+                    }
+                    
+                    // Row 2
+                    HStack(spacing: 8) {
+                        CompactMetric(title: "Horn", value: commuteTracker.currentMetrics.hornEvents, color: DesignSystem.Colors.primary)
+                        CompactMetric(title: "Siren", value: commuteTracker.currentMetrics.sirenEvents, color: DesignSystem.Colors.accent)
+                        CompactMetric(title: "Rough", value: commuteTracker.currentMetrics.roughRoadEvents, color: DesignSystem.Colors.speedSlow)
+                        CompactMetric(title: "Speed", value: commuteTracker.currentMetrics.speedViolations, color: DesignSystem.Colors.speedVeryFast)
                     }
                 }
             }
         }
+    }
+    
+    func CompactMetric(title: String, value: Int, color: Color) -> some View {
+        VStack(spacing: 2) {
+            Text("\(value)")
+                .font(.caption)
+                .fontWeight(.bold)
+                .foregroundColor(color)
+            Text(title)
+                .font(.caption2)
+                .foregroundColor(DesignSystem.Colors.secondaryText)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+        .padding(.horizontal, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(color.opacity(0.1))
+        )
     }
     
     func MetricTile(title: String, value: String, color: Color) -> some View {
@@ -3599,39 +3901,6 @@ struct ContentView: View {
         )
     }
     
-    func SlowTrafficTimer(commuteTracker: CommuteTracker) -> some View {
-        HStack(spacing: 12) {
-            // Current slow traffic status indicator
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(commuteTracker.isCurrentlyInSlowTraffic ? Color.red : Color.green)
-                    .frame(width: 8, height: 8)
-                
-                Text(commuteTracker.isCurrentlyInSlowTraffic ? "In Slow Traffic" : "Normal Speed")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .foregroundColor(commuteTracker.isCurrentlyInSlowTraffic ? .red : .green)
-            }
-            
-            Spacer()
-            
-            // Total slow traffic time
-            VStack(alignment: .trailing, spacing: 2) {
-                Text("Slow Traffic Time")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                
-                Text(formatSlowTrafficTime(commuteTracker.currentMetrics.slowTrafficTime, commuteTracker.slowTrafficStartTime))
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                    .foregroundColor(.orange)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color(.systemGray6))
-        .cornerRadius(8)
-    }
     
     private func formatSlowTrafficTime(_ totalTime: TimeInterval, _ currentStartTime: Date?) -> String {
         var displayTime = totalTime
@@ -3652,15 +3921,23 @@ struct ContentView: View {
     }
     
     private func formatSlowTrafficDisplayTime(_ slowTrafficTime: TimeInterval, totalTripDuration: TimeInterval) -> String {
-        let minutes = Int(slowTrafficTime / 60)
+        let totalMinutes = Int(slowTrafficTime / 60)
         let seconds = Int(slowTrafficTime.truncatingRemainder(dividingBy: 60))
         
         // Calculate percentage of trip spent in slow traffic
         let percentage = totalTripDuration > 0 ? (slowTrafficTime / totalTripDuration) * 100 : 0
         
         var timeString: String
-        if minutes > 0 {
-            timeString = "\(minutes)m \(seconds)s"
+        if totalMinutes >= 60 {
+            let hours = totalMinutes / 60
+            let minutes = totalMinutes % 60
+            if minutes > 0 {
+                timeString = "\(hours)hr \(minutes)min"
+            } else {
+                timeString = "\(hours)hr"
+            }
+        } else if totalMinutes > 0 {
+            timeString = "\(totalMinutes)min \(seconds)s"
         } else {
             timeString = "\(seconds)s"
         }
@@ -3751,6 +4028,9 @@ struct ContentView: View {
         }
         if !sensorManager.isMotionAvailable {
         }
+        
+        // Start auto-end monitoring
+        startAutoEndMonitoring()
     }
     
     private func setupSoundEventCallbacks() {
@@ -3789,19 +4069,25 @@ struct ContentView: View {
         timer?.invalidate()
         timer = nil
         
+        // Stop auto-end monitoring
+        stopAutoEndMonitoring()
+        
         // Re-enable screen sleep when trip ends
         UIApplication.shared.isIdleTimerDisabled = false
         
         
         commuteTracker.stopCommute { [self] completedTripId in
-            // Store the completed trip ID and navigate to history
+            // Store the completed trip ID and navigate to trip details
             self.completedTripId = completedTripId
             self.showingTripCompletion = true
             
-            // Add a small delay for loading state, then navigate
+            // Add a small delay for loading state, then open trip details
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.selectedTab = 1 // Navigate to History tab
-                self.expandedCommuteIds = [completedTripId] // Expand the completed trip
+                // Find the completed commute record and open trip details
+                if let completedCommute = self.commuteTracker.commutes.first(where: { $0.id == completedTripId }) {
+                    self.selectedTab = 1 // Navigate to History tab first
+                    self.tripDetailsCommute = completedCommute // This will trigger navigation to trip details
+                }
                 self.showingTripCompletion = false
             }
         }
@@ -3820,6 +4106,22 @@ struct ContentView: View {
         } else {
             return String(format: "%02d:%02d", minutes, seconds)
         }
+    }
+    
+    private func renameTrip(_ commute: CommuteRecord, to newName: String) {
+        print("🔄 Renaming trip: \(commute.type.id) from '\(commute.type.displayName)' to '\(newName)'")
+        
+        if commute.type.isOneOff {
+            // For one-off trips, update the commute record directly in CommuteTracker
+            print("🎯 Renaming one-off trip")
+            commuteTracker.renameOneOffTrip(commuteId: commute.id, newName: newName)
+        } else {
+            // For regular commutes, update in TripManager which affects all trips of this type
+            print("🎯 Renaming regular commute")
+            tripManager.updateTrip(tripId: commute.type.id, newName: newName)
+        }
+        
+        print("✅ Trip rename completed")
     }
     
     // MARK: - Data Management Helper Functions
@@ -3861,10 +4163,11 @@ struct ContentView: View {
         return "\(commute.id.uuidString)-\(tripCount)-\(tripNames)"
     }
     
+    
     // MARK: - History View
     func HistoryView() -> some View {
-        NavigationView {
-            Group {
+        NavigationStack {
+            VStack(spacing: 0) {
                 if commuteTracker.commutes.isEmpty {
                     EmptyStateView(
                         icon: "clock.arrow.circlepath",
@@ -3872,19 +4175,126 @@ struct ContentView: View {
                         message: "Start tracking your commutes to see them here with detailed maps and analytics."
                     )
                 } else {
-                    List {
-                        ForEach(commuteTracker.commutes, id: \.id) { commute in
-                            let rowId = buildCommuteRowId(for: commute)
-                            CommuteRow(commute: commute)
-                                .id(rowId)
-                                .listRowBackground(DesignSystem.Colors.cardBackground)
-                                .listRowSeparator(.hidden)
-                                .listRowInsets(EdgeInsets(top: DesignSystem.Spacing.xs, leading: DesignSystem.Spacing.md, bottom: DesignSystem.Spacing.xs, trailing: DesignSystem.Spacing.md))
+                    // Tab Picker and Sort Icon
+                    HStack {
+                        Picker("Trip Type", selection: $historyTabSelection) {
+                            Text("Commutes").tag(0)
+                            Text("One-off Trips").tag(1)
                         }
-                        .onDelete(perform: deleteCommutes)
+                        .pickerStyle(.segmented)
+                        
+                        Spacer()
+                        
+                        // Sort Menu Icon
+                        Menu {
+                            ForEach(TripSortOption.allCases, id: \.self) { option in
+                                // High to Low / Descending option
+                                Button(action: {
+                                    historySortOption = option
+                                    historySortDirection = .descending
+                                }) {
+                                    HStack {
+                                        Text(getSortLabel(for: option, direction: .descending))
+                                            .fontWeight(historySortOption == option && historySortDirection == .descending ? .semibold : .regular)
+                                        Spacer()
+                                        if historySortOption == option && historySortDirection == .descending {
+                                            Image(systemName: "checkmark")
+                                                .foregroundColor(DesignSystem.Colors.primary)
+                                                .font(.body)
+                                                .fontWeight(.bold)
+                                        }
+                                    }
+                                }
+                                
+                                // Low to High / Ascending option
+                                Button(action: {
+                                    historySortOption = option
+                                    historySortDirection = .ascending
+                                }) {
+                                    HStack {
+                                        Text(getSortLabel(for: option, direction: .ascending))
+                                            .fontWeight(historySortOption == option && historySortDirection == .ascending ? .semibold : .regular)
+                                        Spacer()
+                                        if historySortOption == option && historySortDirection == .ascending {
+                                            Image(systemName: "checkmark")
+                                                .foregroundColor(DesignSystem.Colors.primary)
+                                                .font(.body)
+                                                .fontWeight(.bold)
+                                        }
+                                    }
+                                }
+                                
+                                if option != TripSortOption.allCases.last {
+                                    Divider()
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "arrow.up.arrow.down")
+                                .font(.title3)
+                                .foregroundColor(DesignSystem.Colors.primary)
+                        }
                     }
-                    .listStyle(.plain)
-                    .background(DesignSystem.Colors.background)
+                    .padding(.horizontal, DesignSystem.Spacing.md)
+                    .padding(.bottom, DesignSystem.Spacing.sm)
+                    
+                    // Content based on selected tab
+                    if historyTabSelection == 0 {
+                        // Regular Commutes
+                        let regularCommutes = sortCommutes(commuteTracker.commutes.filter { !$0.type.isOneOff }, by: historySortOption, direction: historySortDirection)
+                        Group {
+                            if regularCommutes.isEmpty {
+                                EmptyStateView(
+                                    icon: "repeat.circle",
+                                    title: "No Regular Commutes",
+                                    message: "Regular commutes you've saved will appear here."
+                                )
+                            } else {
+                                List {
+                                    ForEach(regularCommutes, id: \.id) { commute in
+                                        let rowId = buildCommuteRowId(for: commute)
+                                        CommuteRow(commute: commute)
+                                            .id(rowId)
+                                            .listRowBackground(DesignSystem.Colors.cardBackground)
+                                            .listRowSeparator(.hidden)
+                                            .listRowInsets(EdgeInsets(top: DesignSystem.Spacing.xs, leading: DesignSystem.Spacing.md, bottom: DesignSystem.Spacing.xs, trailing: DesignSystem.Spacing.md))
+                                    }
+                                    .onDelete { offsets in
+                                        deleteCommutes(from: regularCommutes, at: offsets)
+                                    }
+                                }
+                                .listStyle(.plain)
+                                .background(DesignSystem.Colors.background)
+                            }
+                        }
+                    } else {
+                        // One-off Trips
+                        let oneOffTrips = sortCommutes(commuteTracker.commutes.filter { $0.type.isOneOff }, by: historySortOption, direction: historySortDirection)
+                        Group {
+                            if oneOffTrips.isEmpty {
+                                EmptyStateView(
+                                    icon: "location.circle",
+                                    title: "No One-off Trips",
+                                    message: "Individual trips you've tracked will appear here."
+                                )
+                            } else {
+                                List {
+                                    ForEach(oneOffTrips, id: \.id) { commute in
+                                        let rowId = buildCommuteRowId(for: commute)
+                                        CommuteRow(commute: commute)
+                                            .id(rowId)
+                                            .listRowBackground(DesignSystem.Colors.cardBackground)
+                                            .listRowSeparator(.hidden)
+                                            .listRowInsets(EdgeInsets(top: DesignSystem.Spacing.xs, leading: DesignSystem.Spacing.md, bottom: DesignSystem.Spacing.xs, trailing: DesignSystem.Spacing.md))
+                                    }
+                                    .onDelete { offsets in
+                                        deleteCommutes(from: oneOffTrips, at: offsets)
+                                    }
+                                }
+                                .listStyle(.plain)
+                                .background(DesignSystem.Colors.background)
+                            }
+                        }
+                    }
                 }
             }
             .background(DesignSystem.Colors.background)
@@ -3894,28 +4304,15 @@ struct ContentView: View {
                 
                 ToolbarItem(placement: .navigationBarTrailing) {
                     if !commuteTracker.commutes.isEmpty {
-                        Menu {
-                            ShareLink("Export Summary", item: createCSVFile())
-                            
-                            Button(role: .destructive) {
-                                showDeleteAllAlert = true
-                            } label: {
-                                Label("Delete All", systemImage: "trash")
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
+                        ShareLink(item: createCSVFile()) {
+                            Image(systemName: "square.and.arrow.up")
                                 .foregroundColor(DesignSystem.Colors.primary)
                         }
                     }
                 }
             }
-            .alert("Delete All Trips", isPresented: $showDeleteAllAlert) {
-                Button("Cancel", role: .cancel) { }
-                Button("Delete All", role: .destructive) {
-                    commuteTracker.deleteAllCommutes()
-                }
-            } message: {
-                Text("This will permanently delete all your commute history. This action cannot be undone.")
+            .navigationDestination(item: $tripDetailsCommute) { commute in
+                TripDetailNavigationView(commute: commute)
             }
         }
     }
@@ -3924,89 +4321,211 @@ struct ContentView: View {
         commuteTracker.deleteCommute(at: offsets)
     }
     
+    private func deleteCommutes(from filteredCommutes: [CommuteRecord], at offsets: IndexSet) {
+        // Convert filtered offsets to original indices in the full commutes array
+        let commutesToDelete = offsets.map { filteredCommutes[$0] }
+        for commuteToDelete in commutesToDelete {
+            if let originalIndex = commuteTracker.commutes.firstIndex(where: { $0.id == commuteToDelete.id }) {
+                commuteTracker.deleteCommute(at: IndexSet(integer: originalIndex))
+            }
+        }
+    }
+    
+    private func sortCommutes(_ commutes: [CommuteRecord], by sortOption: TripSortOption, direction: SortDirection) -> [CommuteRecord] {
+        let sorted: [CommuteRecord]
+        
+        switch sortOption {
+        case .chronological:
+            sorted = commutes.sorted { $0.startTime > $1.startTime } // Most recent first for descending
+        case .dqi:
+            sorted = commutes.sorted { $0.drivingMetrics.drivingScore > $1.drivingMetrics.drivingScore } // Highest DQI first for descending
+        case .duration:
+            sorted = commutes.sorted { $0.duration > $1.duration } // Longest duration first for descending
+        case .tripName:
+            sorted = commutes.sorted { commute1, commute2 in
+                let tripName1 = tripManager.availableTrips.first(where: { $0.id == commute1.type.id })?.displayName ?? commute1.type.displayName
+                let tripName2 = tripManager.availableTrips.first(where: { $0.id == commute2.type.id })?.displayName ?? commute2.type.displayName
+                return tripName1 < tripName2 // A-Z for descending (natural order)
+            }
+        }
+        
+        // Reverse if ascending is requested
+        return direction == .ascending ? sorted.reversed() : sorted
+    }
+    
+    private func getSortLabel(for option: TripSortOption, direction: SortDirection) -> String {
+        switch option {
+        case .chronological:
+            return direction == .descending ? "Newest First" : "Oldest First"
+        case .dqi:
+            return direction == .descending ? "Highest DQI First" : "Lowest DQI First"
+        case .duration:
+            return direction == .descending ? "Longest First" : "Shortest First"
+        case .tripName:
+            return direction == .descending ? "A to Z" : "Z to A"
+        }
+    }
+    
+    private func generateAutoTripName() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEEE 'at' h:mma" // e.g., "Tuesday at 10:30AM"
+        let timeString = formatter.string(from: Date())
+        return "Trip on \(timeString)"
+    }
+    
+    private func startAutoEndMonitoring() {
+        // Start timer to check location stability every minute
+        autoEndTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
+            checkForAutoEnd()
+        }
+    }
+    
+    private func stopAutoEndMonitoring() {
+        autoEndTimer?.invalidate()
+        autoEndTimer = nil
+        lastStableLocation = nil
+        stableLocationStartTime = nil
+    }
+    
+    private func checkForAutoEnd() {
+        guard isTracking,
+              let currentLocation = locationManager.currentLocation,
+              let activeCommute = commuteTracker.activeCommute else {
+            return
+        }
+        
+        // Check if trip has been running for more than 24 hours (failsafe)
+        let tripDuration = Date().timeIntervalSince(activeCommute.startTime)
+        if tripDuration >= autoEndTimeLimit {
+            print("🚨 Auto-ending trip after 24 hours")
+            autoEndTrip(reason: "24-hour limit reached")
+            return
+        }
+        
+        // Check location stability
+        if let lastStable = lastStableLocation {
+            let distance = currentLocation.distance(from: lastStable)
+            
+            if distance <= stableLocationRadius {
+                // Still in same stable location
+                if let stableStart = stableLocationStartTime {
+                    let stableDuration = Date().timeIntervalSince(stableStart)
+                    let stableLocationDuration = settingsManager.autoEndTimeHours * 60 * 60 // Convert hours to seconds
+                    if stableDuration >= stableLocationDuration {
+                        print("🚨 Auto-ending trip after \(Int(stableDuration/3600)) hours at stable location")
+                        // Calculate proper end time (when stability started + a small buffer)
+                        let properEndTime = stableStart.addingTimeInterval(10 * 60) // 10 minutes after arriving
+                        autoEndTrip(reason: "Location stable for \(Int(stableDuration/3600)) hours", endTime: properEndTime)
+                        return
+                    }
+                }
+            } else {
+                // Moved to new location, reset stability tracking
+                lastStableLocation = currentLocation
+                stableLocationStartTime = Date()
+            }
+        } else {
+            // First location check
+            lastStableLocation = currentLocation
+            stableLocationStartTime = Date()
+        }
+    }
+    
+    private func autoEndTrip(reason: String, endTime: Date? = nil) {
+        print("🛑 Auto-ending trip: \(reason)")
+        
+        // For now, just use normal stop tracking
+        // TODO: Could enhance CommuteTracker to accept custom end time if needed
+        stopTracking()
+        stopAutoEndMonitoring()
+    }
+    
     
     func CommuteRow(commute: CommuteRecord) -> some View {
         // Force refresh when tripManager changes by using @ObservedObject
         let tripDisplayName = tripManager.availableTrips.first(where: { $0.id == commute.type.id })?.displayName ?? commute.type.displayName
-        let isExpanded = expandedCommuteIds.contains(commute.id)
         
-        return LegacyCardView {
-            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                        Text(tripDisplayName)
-                            .font(DesignSystem.Typography.headline)
-                            .foregroundColor(DesignSystem.Colors.text)
-                        
-                        HStack(spacing: DesignSystem.Spacing.xs) {
-                            Image(systemName: "calendar")
-                                .font(.caption)
-                                .foregroundColor(DesignSystem.Colors.secondaryText)
+        return Button(action: {
+            // Navigate to trip details view
+            tripDetailsCommute = commute
+        }) {
+            LegacyCardView {
+                VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+                    // Top row: Trip name and DQI
+                    HStack(alignment: .center, spacing: DesignSystem.Spacing.md) {
+                        // Trip info
+                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                            HStack(spacing: 8) {
+                                // Trip type indicator - just icon
+                                if commute.type.isOneOff {
+                                    Image(systemName: "location.circle")
+                                        .font(.caption)
+                                        .foregroundColor(.orange)
+                                } else {
+                                    Image(systemName: "repeat.circle")
+                                        .font(.caption)
+                                        .foregroundColor(.blue)
+                                }
+                                
+                                Text(tripDisplayName)
+                                    .font(DesignSystem.Typography.headline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+                            }
                             
-                            Text(commute.formattedDate)
-                                .font(DesignSystem.Typography.subheadline)
-                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                            // Date and departure time on same line
+                            HStack(spacing: DesignSystem.Spacing.xs) {
+                                Image(systemName: "calendar")
+                                    .font(.caption)
+                                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                                
+                                Text(commute.formattedDate)
+                                    .font(DesignSystem.Typography.subheadline)
+                                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                                
+                                Text("•")
+                                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                                
+                                Text(commute.formattedStartTime)
+                                    .font(DesignSystem.Typography.subheadline)
+                                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                            }
+                        }
+                        
+                        Spacer()
+                        
+                        // DQI Score on the right
+                        VStack(spacing: 4) {
+                            Text("\(commute.drivingMetrics.drivingScore)")
+                                .font(.title2)
+                                .fontWeight(.bold)
+                                .foregroundColor(scoreColor(commute.drivingMetrics.drivingScore))
+                            
+                            Text("DQI")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .fontWeight(.medium)
                         }
                     }
                     
-                    Spacer()
-                    
-                    VStack(alignment: .trailing, spacing: DesignSystem.Spacing.xs) {
+                    // Bottom row: Duration
+                    HStack {
                         HStack(spacing: DesignSystem.Spacing.xs) {
                             Image(systemName: "clock")
                                 .font(.caption)
                                 .foregroundColor(DesignSystem.Colors.primary)
                             
                             Text(commute.formattedDuration)
-                                .font(DesignSystem.Typography.headline)
+                                .font(DesignSystem.Typography.subheadline)
                                 .foregroundColor(DesignSystem.Colors.primary)
-                                .fontWeight(.semibold)
+                                .fontWeight(.medium)
                         }
                         
-                        Text(commute.formattedStartTime)
-                            .font(DesignSystem.Typography.caption)
-                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                        Spacer()
                     }
-                    
-                    Button(action: {
-                        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-                            if isExpanded {
-                                // Collapse this trip
-                                expandedCommuteIds.remove(commute.id)
-                            } else {
-                                // Collapse all other trips and expand this one
-                                expandedCommuteIds.removeAll()
-                                expandedCommuteIds.insert(commute.id)
-                            }
-                        }
-                    }) {
-                        Image(systemName: isExpanded ? "chevron.up.circle.fill" : "chevron.down.circle.fill")
-                            .font(.title3)
-                            .foregroundColor(DesignSystem.Colors.primary)
-                            .animation(.spring(response: 0.4, dampingFraction: 0.8), value: isExpanded)
-                    }
-                    .buttonStyle(.plain)
-                }
-                
-                
-                if isExpanded {
-                    Divider()
-                        .background(DesignSystem.Colors.borderColor)
-                    
-                    // Full driving metrics in expanded state
-                    DrivingSummaryBar(metrics: commute.drivingMetrics)
-                    
-                    TripDetailView(commute: commute)
-                        .id("expanded-\(commute.id)")
-                        .transition(.asymmetric(
-                            insertion: .opacity.combined(with: .scale(scale: 0.95)).combined(with: .offset(y: -10)),
-                            removal: .opacity.combined(with: .scale(scale: 0.95)).combined(with: .offset(y: 10))
-                        ))
                 }
             }
         }
-        .id("commute-row-\(commute.id)-\(isExpanded)")
-        .animation(.spring(response: 0.5, dampingFraction: 0.8), value: isExpanded)
+        .buttonStyle(.plain)
     }
     
     private func getTripIcon(for tripId: String) -> String {
@@ -4014,11 +4533,39 @@ struct ContentView: View {
         return ""
     }
     
-    func DrivingSummaryBar(metrics: DrivingMetrics) -> some View {
+    
+    func CompactMetric(icon: String, value: String, color: Color, title: String? = nil) -> some View {
+        VStack(spacing: DesignSystem.Spacing.xs) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundColor(color)
+            
+            Text(value)
+                .font(DesignSystem.Typography.caption)
+                .fontWeight(.bold)
+                .foregroundColor(DesignSystem.Colors.text)
+            
+            if let title = title {
+                Text(title)
+                    .font(.system(size: 9))
+                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, DesignSystem.Spacing.xs)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                .fill(color.opacity(0.1))
+        )
+    }
+    
+    func DrivingSummaryCard(metrics: DrivingMetrics) -> some View {
         VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
             HStack {
                 VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                    Text("Driving Quality")
+                    Text("DQI - Drive Quality Index")
                         .font(DesignSystem.Typography.caption)
                         .foregroundColor(DesignSystem.Colors.secondaryText)
                     
@@ -4100,31 +4647,360 @@ struct ContentView: View {
         )
     }
     
-    func CompactMetric(icon: String, value: String, color: Color, title: String? = nil) -> some View {
-        VStack(spacing: DesignSystem.Spacing.xs) {
-            Image(systemName: icon)
-                .font(.caption)
-                .foregroundColor(color)
-            
-            Text(value)
-                .font(DesignSystem.Typography.caption)
-                .fontWeight(.bold)
-                .foregroundColor(DesignSystem.Colors.text)
-            
-            if let title = title {
-                Text(title)
-                    .font(.system(size: 9))
-                    .foregroundColor(DesignSystem.Colors.secondaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+    func TripDetailView(commute: CommuteRecord) -> some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Driving Summary Card
+                    DrivingSummaryCard(metrics: commute.drivingMetrics)
+                    
+                    // Traffic Analysis
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Traffic Analysis")
+                            .font(.headline)
+                            .foregroundColor(.primary)
+                            
+                        // Slow Traffic Time Summary
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Image(systemName: "clock.fill")
+                                        .foregroundColor(.red)
+                                    Text("Time in Slow Traffic (<15 km/h)")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                }
+                                
+                                Text(formatSlowTrafficDisplayTime(commute.drivingMetrics.slowTrafficTime, totalTripDuration: commute.duration))
+                                    .font(.title2)
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.red)
+                            }
+                            
+                            Spacer()
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 12)
+                        .background(Color(.systemGray6))
+                        .cornerRadius(8)
+                        
+                        // Heavy Traffic Periods Detail
+                        if !commute.heavyTrafficPeriods.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Image(systemName: "car.fill")
+                                        .foregroundColor(.orange)
+                                    Text("\(commute.heavyTrafficPeriods.count) heavy traffic period\(commute.heavyTrafficPeriods.count == 1 ? "" : "s") detected")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                }
+                            
+                                ForEach(Array(commute.heavyTrafficPeriods.enumerated()), id: \.offset) { index, period in
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Period \(index + 1): \(period.formattedDuration)")
+                                                .font(.caption)
+                                                .fontWeight(.semibold)
+                                            Text("Avg Speed: \(String(format: "%.1f", period.averageSpeed)) km/h")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        Text(CommuteRecord.timeFormatter.string(from: period.startTime))
+                                            .font(.caption)
+                                            .foregroundColor(.orange)
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
+                            .padding(.vertical, 8)
+                            .padding(.horizontal, 12)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(8)
+                        }
+                    }
+                    
+                    // Route Map Section
+                    if !commute.pathPoints.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Route Map")
+                                .font(.headline)
+                                .foregroundColor(.primary)
+                            
+                            // Speed Legend
+                            SpeedLegendView()
+                            
+                            Button(action: {
+                                fullScreenMapCommute = commute
+                            }) {
+                                TripMapView(commute: commute)
+                                    .frame(height: 200)
+                                    .cornerRadius(12)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(Color.blue.opacity(0.3), lineWidth: 1)
+                                    )
+                                    .overlay(
+                                        VStack {
+                                            Spacer()
+                                            HStack {
+                                                Spacer()
+                                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                                    .font(.title2)
+                                                    .foregroundColor(.white)
+                                                    .background(Circle().fill(Color.black.opacity(0.6)).frame(width: 32, height: 32))
+                                                    .padding(8)
+                                            }
+                                        }
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle(tripManager.availableTrips.first(where: { $0.id == commute.type.id })?.displayName ?? commute.type.displayName)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        tripDetailsCommute = nil
+                    }
+                    .foregroundColor(.primary)
+                }
             }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, DesignSystem.Spacing.xs)
-        .background(
-            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                .fill(color.opacity(0.1))
-        )
+    }
+    
+    func TripDetailNavigationView(commute: CommuteRecord) -> some View {
+        // Get the latest trip name - for one-off trips, get from commutes array; for regular trips, get from tripManager
+        let currentTripName: String
+        if commute.type.isOneOff {
+            // For one-off trips, get the current name from the commutes array
+            currentTripName = commuteTracker.commutes.first(where: { $0.id == commute.id })?.type.displayName ?? commute.type.displayName
+        } else {
+            // For regular commutes, get from tripManager
+            currentTripName = tripManager.availableTrips.first(where: { $0.id == commute.type.id })?.displayName ?? commute.type.displayName
+        }
+        
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // Trip Info & Traffic Analysis Card
+                VStack(alignment: .leading, spacing: 12) {
+                    // Trip Basic Info
+                    VStack(alignment: .leading, spacing: 8) {
+                        // Trip Name
+                        HStack(spacing: 8) {
+                            // Trip type indicator - just icon
+                            if commute.type.isOneOff {
+                                Image(systemName: "location.circle")
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            } else {
+                                Image(systemName: "repeat.circle")
+                                    .font(.caption)
+                                    .foregroundColor(.blue)
+                            }
+                            
+                            Text(currentTripName)
+                                .font(.headline)
+                                .foregroundColor(.primary)
+                                .fontWeight(.semibold)
+                        }
+                        
+                        // Date and Departure Time
+                        HStack(spacing: DesignSystem.Spacing.xs) {
+                            Image(systemName: "calendar")
+                                .font(.caption)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                            
+                            Text(commute.formattedDate)
+                                .font(DesignSystem.Typography.subheadline)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                            
+                            Text("•")
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                            
+                            Text(commute.formattedStartTime)
+                                .font(DesignSystem.Typography.subheadline)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                        }
+                        
+                        // Trip Duration and Slow Traffic Combined
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: DesignSystem.Spacing.xs) {
+                                    Image(systemName: "clock")
+                                        .font(.caption)
+                                        .foregroundColor(DesignSystem.Colors.primary)
+                                    
+                                    Text("Total: \(commute.formattedDuration)")
+                                        .font(DesignSystem.Typography.subheadline)
+                                        .foregroundColor(DesignSystem.Colors.primary)
+                                        .fontWeight(.medium)
+                                }
+                                
+                                HStack(spacing: DesignSystem.Spacing.xs) {
+                                    Image(systemName: "clock.fill")
+                                        .font(.caption)
+                                        .foregroundColor(.red)
+                                    
+                                    Text("Slow: \(formatSlowTrafficDisplayTime(commute.drivingMetrics.slowTrafficTime, totalTripDuration: commute.duration))")
+                                        .font(DesignSystem.Typography.subheadline)
+                                        .foregroundColor(.red)
+                                        .fontWeight(.medium)
+                                }
+                            }
+                            
+                            Spacer()
+                        }
+                    }
+                    
+                    Divider()
+                        .background(DesignSystem.Colors.borderColor)
+                    
+                    // Traffic Analysis Section
+                    VStack(alignment: .leading, spacing: 8) {
+                        // Heavy Traffic Periods Detail
+                        if !commute.heavyTrafficPeriods.isEmpty {
+                            Text("Traffic Analysis")
+                                .font(.headline)
+                                .foregroundColor(.primary)
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Image(systemName: "car.fill")
+                                        .foregroundColor(.orange)
+                                    Text("\(commute.heavyTrafficPeriods.count) heavy traffic period\(commute.heavyTrafficPeriods.count == 1 ? "" : "s") detected")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                }
+                            
+                                ForEach(Array(commute.heavyTrafficPeriods.enumerated()), id: \.offset) { index, period in
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Period \(index + 1): \(period.formattedDuration)")
+                                                .font(.caption)
+                                                .fontWeight(.semibold)
+                                            Text("Avg Speed: \(String(format: "%.1f", period.averageSpeed)) km/h")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        Text(CommuteRecord.timeFormatter.string(from: period.startTime))
+                                            .font(.caption)
+                                            .foregroundColor(.orange)
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
+                            .padding(.vertical, 8)
+                            .padding(.horizontal, 12)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(8)
+                        }
+                    }
+                }
+                .padding(DesignSystem.Spacing.sm)
+                .background(
+                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                        .fill(DesignSystem.Colors.background.opacity(0.5))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                .stroke(DesignSystem.Colors.borderColor, lineWidth: 0.5)
+                        )
+                )
+                
+                // Driving Summary Card
+                DrivingSummaryCard(metrics: commute.drivingMetrics)
+                
+                // Route Map Section
+                if !commute.pathPoints.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Route Map")
+                            .font(.headline)
+                            .foregroundColor(.primary)
+                        
+                        // Speed Legend
+                        SpeedLegendView()
+                        
+                        Button(action: {
+                            fullScreenMapCommute = commute
+                        }) {
+                            TripMapView(commute: commute)
+                                .frame(height: 200)
+                                .cornerRadius(12)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .stroke(Color.blue.opacity(0.3), lineWidth: 1)
+                                )
+                                .overlay(
+                                    VStack {
+                                        Spacer()
+                                        HStack {
+                                            Spacer()
+                                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                                .font(.title2)
+                                                .foregroundColor(.white)
+                                                .background(Circle().fill(Color.black.opacity(0.6)).frame(width: 32, height: 32))
+                                                .padding(8)
+                                        }
+                                    }
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding()
+        }
+        .navigationTitle("Trip Details")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Menu {
+                    Button(action: {
+                        renamingCommute = commute
+                        newTripName = currentTripName
+                        showRenameDialog = true
+                    }) {
+                        Label("Rename Trip", systemImage: "pencil")
+                    }
+                    
+                    Button(role: .destructive, action: {
+                        tripToDelete = commute
+                        showDeleteTripAlert = true
+                    }) {
+                        Label("Delete Trip", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .foregroundColor(.primary)
+                }
+            }
+        }
+        .alert("Delete Trip", isPresented: $showDeleteTripAlert) {
+            Button("Cancel", role: .cancel) {
+                tripToDelete = nil
+            }
+            Button("Delete", role: .destructive) {
+                if let commute = tripToDelete {
+                    deleteTrip(commute)
+                }
+                tripToDelete = nil
+            }
+        } message: {
+            Text("Are you sure you want to delete this trip? This action cannot be undone.")
+        }
+    }
+    
+    private func deleteTrip(_ commute: CommuteRecord) {
+        // Delete the commute from the tracker
+        commuteTracker.deleteCommute(commute: commute)
+        
+        // Navigate back to trips history page
+        selectedTab = 1 // Switch to History tab
+        tripDetailsCommute = nil // Close the trip details view
     }
     
     // MARK: - Analytics View
@@ -4200,14 +5076,9 @@ struct ContentView: View {
                         }
                     }
                 } label: {
-                    HStack(spacing: 4) {
-                        Text(selectedCommuteFilter.displayName)
-                            .font(.caption)
-                            .foregroundColor(DesignSystem.Colors.primary)
-                        Image(systemName: "chevron.down")
-                            .font(.caption2)
-                            .foregroundColor(DesignSystem.Colors.primary)
-                    }
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                        .font(.title3)
+                        .foregroundColor(DesignSystem.Colors.primary)
                 }
             }
         }
@@ -4290,190 +5161,207 @@ struct ContentView: View {
     }
     
     func OverallStats(filteredCommutes: [CommuteRecord]) -> some View {
-        // Guard against empty or invalid input
-        guard !filteredCommutes.isEmpty else {
+        if filteredCommutes.isEmpty {
             return AnyView(
-                Text("No data available")
+                Text("No trip data available")
                     .foregroundColor(.secondary)
                     .padding()
             )
         }
         
-        // Safely compute statistics with extensive error handling
-        var safeCommutes: [CommuteRecord] = []
+        // Calculate actual statistics from filtered commutes (already guarded by isEmpty check above)
+        let totalDuration = filteredCommutes.reduce(0) { $0 + $1.duration }
+        let avgDuration = totalDuration / Double(filteredCommutes.count)
+        let avgScore = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.drivingScore }) / Double(filteredCommutes.count)
+        let totalTrafficTime = filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.slowTrafficTime }
+        let avgTrafficTime = totalTrafficTime / Double(filteredCommutes.count)
+        let avgSpeed = filteredCommutes.reduce(0.0) { $0 + $1.drivingMetrics.averageSpeed } / Double(filteredCommutes.count)
         
-        for commute in filteredCommutes {
-            // Validate each commute before including it
-            guard commute.duration > 0 && commute.duration.isFinite else {
-                continue
-            }
-            
-            safeCommutes.append(commute)
-        }
+        // Calculate average events per trip
+        let avgBraking = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.brakingEventCount }) / Double(filteredCommutes.count)
+        let avgHardBraking = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.hardBrakingEventCount }) / Double(filteredCommutes.count)
+        let avgSpeeding = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.speedViolations }) / Double(filteredCommutes.count)
+        let avgTurns = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.sharpTurns }) / Double(filteredCommutes.count)
+        let avgRoughRoad = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.roughRoadEvents }) / Double(filteredCommutes.count)
+        let avgAcceleration = Double(filteredCommutes.reduce(0) { $0 + $1.drivingMetrics.accelerationEvents }) / Double(filteredCommutes.count)
         
-        // If no valid commutes after filtering, return empty state
-        guard !safeCommutes.isEmpty else {
-            return AnyView(
-                Text("No valid trip data")
-                    .foregroundColor(.secondary)
-                    .padding()
-            )
-        }
-        
-        let totalCommutes = safeCommutes.count
-        
-        // Calculate totals with comprehensive error checking
-        var totalDuration: TimeInterval = 0
-        var totalDrivingScore: Int = 0
-        var totalBrakingEvents: Int = 0
-        var totalAccelerationEvents: Int = 0
-        var totalPhoneDistractions: Int = 0
-        var totalHorns: Int = 0
-        var totalSirens: Int = 0
-        var totalSlowTrafficTime: TimeInterval = 0
-        
-        for commute in safeCommutes {
-            // Safely access each property with validation
-            let duration = commute.duration
-            if duration.isFinite && duration >= 0 {
-                totalDuration += duration
-            }
-            
-            let score = commute.drivingMetrics.drivingScore
-            if score >= 0 && score <= 100 {
-                totalDrivingScore += score
-            }
-            
-            totalBrakingEvents += max(0, commute.drivingMetrics.brakingEventCount)
-            totalAccelerationEvents += max(0, commute.drivingMetrics.accelerationEvents)
-            totalPhoneDistractions += max(0, commute.drivingMetrics.phoneDistractions)
-            totalHorns += max(0, commute.drivingMetrics.hornEvents)
-            totalSirens += max(0, commute.drivingMetrics.sirenEvents)
-            
-            let slowTraffic = commute.drivingMetrics.slowTrafficTime
-            if slowTraffic.isFinite && slowTraffic >= 0 {
-                totalSlowTrafficTime += slowTraffic
-            }
-        }
-        
-        // Calculate averages with division by zero protection
-        let count = Double(safeCommutes.count)
-        let averageDuration = count > 0 ? totalDuration / count / 60.0 : 0
-        let averageDrivingScore = count > 0 ? totalDrivingScore / safeCommutes.count : 0
-        let averageBrakingEvents = count > 0 ? Double(totalBrakingEvents) / count : 0
-        let averageAccelerationEvents = count > 0 ? Double(totalAccelerationEvents) / count : 0
-        let averagePhoneDistractions = count > 0 ? Double(totalPhoneDistractions) / count : 0
-        let averageHorns = count > 0 ? Double(totalHorns) / count : 0
-        let averageSirens = count > 0 ? Double(totalSirens) / count : 0
-        let averageSlowTrafficTime = count > 0 ? totalSlowTrafficTime / count / 60.0 : 0
-        
-        return AnyView(CardView {
-            VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
+        return AnyView(
+            CardView {
+                VStack(alignment: .leading, spacing: DesignSystem.Spacing.md) {
+                    // Header with title and trip count
+                    HStack {
                         Text("Overview")
                             .font(DesignSystem.Typography.headline)
-                            .foregroundColor(DesignSystem.Colors.text)
                         
-                        Text("\(totalCommutes) commute\(totalCommutes == 1 ? "" : "s")")
+                        Spacer()
+                        
+                        Text("\(filteredCommutes.count) trips")
                             .font(DesignSystem.Typography.caption)
                             .foregroundColor(DesignSystem.Colors.secondaryText)
                     }
-                    
-                    Spacer()
-                    
-                    CompactStatItem(
-                        title: "Score", 
-                        value: "\(averageDrivingScore)", 
-                        color: scoreColor(averageDrivingScore),
-                        icon: "star.fill"
-                    )
-                }
-                
-                HStack(spacing: DesignSystem.Spacing.lg) {
-                    CompactStatItem(
-                        title: "Duration", 
-                        value: "\(Int(averageDuration))m", 
-                        color: DesignSystem.Colors.success,
-                        icon: "clock"
-                    )
-                    
-                    CompactStatItem(
-                        title: "Traffic", 
-                        value: "\(Int(averageSlowTrafficTime))m", 
-                        color: DesignSystem.Colors.warning,
-                        icon: "tortoise"
-                    )
-                    
-                    Spacer()
-                }
-                
-                // Individual event metrics in compact rows
-                if averageBrakingEvents > 0 || averageAccelerationEvents > 0 || averagePhoneDistractions > 0 || averageHorns > 0 || averageSirens > 0 {
-                    HStack(spacing: DesignSystem.Spacing.md) {
-                        if averageBrakingEvents > 0 {
-                            CompactStatItem(
-                                title: "Braking", 
-                                value: String(format: "%.1f", averageBrakingEvents), 
-                                color: DesignSystem.Colors.error,
-                                icon: "exclamationmark.triangle.fill"
-                            )
-                        }
-                        
-                        if averageAccelerationEvents > 0 {
-                            CompactStatItem(
-                                title: "Acceleration", 
-                                value: String(format: "%.1f", averageAccelerationEvents), 
-                                color: DesignSystem.Colors.accent,
-                                icon: "forward.fill"
-                            )
-                        }
-                        
-                        if averagePhoneDistractions > 0 {
-                            CompactStatItem(
-                                title: "Phone Use", 
-                                value: String(format: "%.1f", averagePhoneDistractions), 
-                                color: DesignSystem.Colors.error,
-                                icon: "iphone"
-                            )
+                    // Top statistics row with 3 metrics
+                    HStack(spacing: DesignSystem.Spacing.lg) {
+                        VStack(alignment: .center, spacing: 2) {
+                            Text("Avg Duration")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            
+                            let minutes = Int(avgDuration / 60)
+                            Text("\(minutes)m")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                                .foregroundColor(.primary)
                         }
                         
                         Spacer()
-                    }
-                    
-                    if averageHorns > 0 || averageSirens > 0 {
-                        HStack(spacing: DesignSystem.Spacing.md) {
-                            if averageHorns > 0 {
-                                CompactStatItem(
-                                    title: "Horns", 
-                                    value: String(format: "%.1f", averageHorns), 
-                                    color: DesignSystem.Colors.primary,
-                                    icon: "speaker.wave.3.fill"
-                                )
-                            }
+                        
+                        VStack(alignment: .center, spacing: 2) {
+                            Text("Avg Speed")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
                             
-                            if averageSirens > 0 {
-                                CompactStatItem(
-                                    title: "Sirens", 
-                                    value: String(format: "%.1f", averageSirens), 
-                                    color: DesignSystem.Colors.accent,
-                                    icon: "music.note"
-                                )
-                            }
+                            Text("\(String(format: "%.1f", avgSpeed))km/h")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                                .foregroundColor(.blue)
+                        }
+                        
+                        Spacer()
+                        
+                        VStack(alignment: .center, spacing: 2) {
+                            Text("Avg Traffic")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
                             
-                            Spacer()
+                            let trafficMinutes = Int(avgTrafficTime / 60)
+                            Text("\(trafficMinutes)m")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                                .foregroundColor(trafficMinutes > 5 ? .red : trafficMinutes > 2 ? .orange : .green)
                         }
                     }
-                }
-                
-                if averageBrakingEvents > 0 || averageSlowTrafficTime > 0 || averageAccelerationEvents > 0 || averagePhoneDistractions > 0 || averageHorns > 0 || averageSirens > 0 {
+                    
                     Divider()
                         .background(DesignSystem.Colors.borderColor)
                     
-                    DrivingEventsChart(filteredCommutes: safeCommutes)
+                    // Average Events Per Trip Section
+                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.sm) {
+                        Text("Average Events Per Trip")
+                            .font(DesignSystem.Typography.subheadline)
+                            .fontWeight(.semibold)
+                            .foregroundColor(DesignSystem.Colors.text)
+                        
+                        // Event types grid layout
+                        VStack(spacing: DesignSystem.Spacing.xs) {
+                            // First row
+                            HStack(spacing: DesignSystem.Spacing.md) {
+                                EventStatCard(
+                                    icon: "backward.fill",
+                                    title: "Braking",
+                                    value: String(format: "%.1f", avgBraking),
+                                    color: .blue
+                                )
+                                
+                                EventStatCard(
+                                    icon: "exclamationmark.triangle.fill",
+                                    title: "Hard Braking",
+                                    value: String(format: "%.1f", avgHardBraking),
+                                    color: .red
+                                )
+                                
+                                EventStatCard(
+                                    icon: "speedometer",
+                                    title: "Speeding",
+                                    value: String(format: "%.1f", avgSpeeding),
+                                    color: .orange
+                                )
+                            }
+                            
+                            // Second row
+                            HStack(spacing: DesignSystem.Spacing.md) {
+                                EventStatCard(
+                                    icon: "arrow.triangle.turn.up.right.circle",
+                                    title: "Sharp Turns",
+                                    value: String(format: "%.1f", avgTurns),
+                                    color: .purple
+                                )
+                                
+                                EventStatCard(
+                                    icon: "road.lanes.curved.right",
+                                    title: "Rough Roads",
+                                    value: String(format: "%.1f", avgRoughRoad),
+                                    color: .brown
+                                )
+                                
+                                EventStatCard(
+                                    icon: "forward.fill",
+                                    title: "Acceleration",
+                                    value: String(format: "%.1f", avgAcceleration),
+                                    color: .green
+                                )
+                            }
+                        }
+                    }
                 }
             }
-        })
+        )
+    }
+    
+    private func EventStatCard(icon: String, title: String, value: String, color: Color) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundColor(color)
+            
+            Text(title)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            
+            Text(value)
+                .font(.subheadline)
+                .fontWeight(.semibold)
+                .foregroundColor(.primary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, DesignSystem.Spacing.xs)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                .fill(color.opacity(0.1))
+        )
+    }
+    
+    func calculateAverageTrafficPercentage(_ commutes: [CommuteRecord]) -> Double {
+        guard !commutes.isEmpty else { return 0 }
+        
+        let totalPercentage = commutes.reduce(0.0) { total, commute in
+            // Guard against divide by zero and negative duration
+            guard commute.duration > 0 else { return total }
+            let percentage = (commute.drivingMetrics.slowTrafficTime / commute.duration) * 100
+            // Guard against invalid percentage calculations
+            guard percentage.isFinite && percentage >= 0 else { return total }
+            return total + percentage
+        }
+        
+        return totalPercentage / Double(commutes.count)
+    }
+    
+    func trafficPercentageColor(_ percentage: Double) -> Color {
+        switch percentage {
+        case 0..<5: return .green
+        case 5..<15: return .yellow
+        case 15..<25: return .orange
+        default: return .red
+        }
+    }
+    
+    func trafficLevelDescription(_ percentage: Double) -> String {
+        switch percentage {
+        case 0..<5: return "Excellent"
+        case 5..<15: return "Good"
+        case 15..<25: return "Heavy"
+        default: return "Very Heavy"
+        }
     }
     
     func TrafficAnalysisInsights(filteredCommutes: [CommuteRecord]) -> some View {
@@ -4615,9 +5503,24 @@ struct ContentView: View {
     }
     
     func TrafficComparisonRow(title: String, slowTrafficTime: TimeInterval, tripDuration: TimeInterval, date: String, color: Color) -> some View {
-        let trafficMinutes = Int(slowTrafficTime / 60)
-        let trafficSeconds = Int(slowTrafficTime.truncatingRemainder(dividingBy: 60))
+        let totalMinutes = Int(slowTrafficTime / 60)
+        let seconds = Int(slowTrafficTime.truncatingRemainder(dividingBy: 60))
         let trafficPercentage = tripDuration > 0 ? (slowTrafficTime / tripDuration) * 100 : 0
+        
+        var timeString: String
+        if totalMinutes >= 60 {
+            let hours = totalMinutes / 60
+            let minutes = totalMinutes % 60
+            if minutes > 0 {
+                timeString = "\(hours)hr \(minutes)min"
+            } else {
+                timeString = "\(hours)hr"
+            }
+        } else if totalMinutes > 0 {
+            timeString = "\(totalMinutes)min \(seconds)s"
+        } else {
+            timeString = "\(seconds)s"
+        }
         
         return HStack {
             VStack(alignment: .leading, spacing: 2) {
@@ -4633,7 +5536,7 @@ struct ContentView: View {
             Spacer()
             
             VStack(alignment: .trailing, spacing: 2) {
-                Text(trafficMinutes > 0 ? "\(trafficMinutes)m \(trafficSeconds)s" : "\(trafficSeconds)s")
+                Text(timeString)
                     .font(.headline)
                     .fontWeight(.bold)
                     .foregroundColor(color)
@@ -4648,37 +5551,6 @@ struct ContentView: View {
         .cornerRadius(8)
     }
     
-    
-    private func calculateAverageTrafficPercentage(_ commutes: [CommuteRecord]) -> Double {
-        guard !commutes.isEmpty else { return 0 }
-        
-        let totalPercentage = commutes.reduce(0.0) { total, commute in
-            let percentage = commute.duration > 0 ? (commute.drivingMetrics.slowTrafficTime / commute.duration) * 100 : 0
-            return total + percentage
-        }
-        
-        return totalPercentage / Double(commutes.count)
-    }
-    
-    private func trafficPercentageColor(_ percentage: Double) -> Color {
-        switch percentage {
-        case 0..<5: return .green
-        case 5..<15: return .yellow
-        case 15..<25: return .orange
-        default: return .red
-        }
-    }
-    
-    private func trafficLevelDescription(_ percentage: Double) -> String {
-        switch percentage {
-        case 0..<5: return "Excellent"
-        case 5..<15: return "Good"
-        case 15..<25: return "Heavy"
-        default: return "Very Heavy"
-        }
-    }
-    
-    
     func DrivingTrendsChart(filteredCommutes: [CommuteRecord]) -> some View {
         let recentCommutes = Array(filteredCommutes.suffix(10))
         
@@ -4692,7 +5564,7 @@ struct ContentView: View {
                     let commute = recentCommutes[index]
                     BarMark(
                         x: .value("Trip", index + 1),
-                        y: .value("Score", commute.drivingMetrics.drivingScore)
+                        y: .value("DQI", commute.drivingMetrics.drivingScore)
                     )
                     .foregroundStyle(scoreColor(commute.drivingMetrics.drivingScore))
                     .cornerRadius(2)
@@ -4712,7 +5584,7 @@ struct ContentView: View {
                     }
                 }
                 
-                Text("Showing last \(recentCommutes.count) commutes • Score out of 100")
+                Text("Showing last \(recentCommutes.count) commutes • DQI out of 100")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -4819,7 +5691,7 @@ struct ContentView: View {
         .padding(.vertical, 8)
     }
     
-    private func getWeeklyInsights(from commutes: [CommuteRecord]) -> [String: [CommuteRecord]] {
+    func getWeeklyInsights(from commutes: [CommuteRecord]) -> [String: [CommuteRecord]] {
         let calendar = Calendar.current
         let weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
         var insights: [String: [CommuteRecord]] = [:]
@@ -4834,7 +5706,7 @@ struct ContentView: View {
         return insights
     }
     
-    private func getRecommendation(for commutes: [CommuteRecord]) -> String {
+    func getRecommendation(for commutes: [CommuteRecord]) -> String {
         guard commutes.count >= 2 else {
             return "Need more data (only \(commutes.count) commute\(commutes.count == 1 ? "" : "s"))"
         }
@@ -4844,18 +5716,34 @@ struct ContentView: View {
         return "\(optimalWindow)\n\(trafficSummary)"
     }
     
-    private func getTrafficSummary(for commutes: [CommuteRecord]) -> String {
+    func getTrafficSummary(for commutes: [CommuteRecord]) -> String {
+        guard !commutes.isEmpty else { return "No traffic data available" }
+        
         let avgTrafficTime = commutes.reduce(0) { $0 + $1.drivingMetrics.slowTrafficTime } / Double(commutes.count)
         let avgTrafficPercentage = commutes.reduce(0.0) { total, commute in
             let percentage = commute.duration > 0 ? (commute.drivingMetrics.slowTrafficTime / commute.duration) * 100 : 0
             return total + percentage
         } / Double(commutes.count)
         
-        let trafficMinutes = Int(avgTrafficTime / 60)
-        return "Traffic: \(trafficMinutes)m avg (\(String(format: "%.0f", avgTrafficPercentage))%)"
+        let totalMinutes = Int(avgTrafficTime / 60)
+        
+        let timeString: String
+        if totalMinutes >= 60 {
+            let hours = totalMinutes / 60
+            let minutes = totalMinutes % 60
+            if minutes > 0 {
+                timeString = "\(hours)hr \(minutes)min"
+            } else {
+                timeString = "\(hours)hr"
+            }
+        } else {
+            timeString = "\(totalMinutes)min"
+        }
+        
+        return "Traffic: \(timeString) avg (\(String(format: "%.0f", avgTrafficPercentage))%)"
     }
     
-    private func calculateOptimalDepartureWindow(for commutes: [CommuteRecord]) -> String {
+    func calculateOptimalDepartureWindow(for commutes: [CommuteRecord]) -> String {
         let calendar = Calendar.current
         
         // Create 10-minute time windows throughout the day
@@ -4890,7 +5778,7 @@ struct ContentView: View {
             let avgDuration = data.totalDuration / Double(data.count)
             let avgHeavyTraffic = data.heavyTrafficTime / Double(data.count)
             
-            // Score combines duration and traffic (lower is better)
+            // Rating combines duration and traffic (lower is better)
             // Weight traffic time more heavily as it's usually the main concern
             let score = avgDuration + (avgHeavyTraffic * 2.0)
             
@@ -4910,15 +5798,43 @@ struct ContentView: View {
         let minute = (optimalWindow % 6) * 10
         let endMinute = minute + 10
         
-        let avgDuration = Int(data.totalDuration / Double(data.count) / 60.0)
-        let avgTrafficTime = Int(data.heavyTrafficTime / Double(data.count) / 60.0)
+        let avgDurationMinutes = Int(data.totalDuration / Double(data.count) / 60.0)
+        let avgTrafficMinutes = Int(data.heavyTrafficTime / Double(data.count) / 60.0)
+        
+        // Format average duration
+        let avgDurationString: String
+        if avgDurationMinutes >= 60 {
+            let hours = avgDurationMinutes / 60
+            let minutes = avgDurationMinutes % 60
+            if minutes > 0 {
+                avgDurationString = "\(hours)hr \(minutes)min"
+            } else {
+                avgDurationString = "\(hours)hr"
+            }
+        } else {
+            avgDurationString = "\(avgDurationMinutes)min"
+        }
+        
+        // Format average traffic time
+        let avgTrafficString: String
+        if avgTrafficMinutes >= 60 {
+            let hours = avgTrafficMinutes / 60
+            let minutes = avgTrafficMinutes % 60
+            if minutes > 0 {
+                avgTrafficString = "\(hours)hr \(minutes)min"
+            } else {
+                avgTrafficString = "\(hours)hr"
+            }
+        } else {
+            avgTrafficString = "\(avgTrafficMinutes)min"
+        }
         
         let startTime = String(format: "%02d:%02d", hour, minute)
         let endTime = String(format: "%02d:%02d", hour + (endMinute / 60), endMinute % 60)
         
-        var recommendation = "Best: \(startTime)-\(endTime) (\(avgDuration)min avg"
-        if avgTrafficTime > 0 {
-            recommendation += ", \(avgTrafficTime)min traffic"
+        var recommendation = "Best: \(startTime)-\(endTime) (\(avgDurationString) avg"
+        if avgTrafficMinutes > 0 {
+            recommendation += ", \(avgTrafficString) traffic"
         }
         recommendation += ")"
         
@@ -4988,34 +5904,37 @@ struct ContentView: View {
         let weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
         let chartData = weekdays.compactMap { day -> (day: String, score: Double)? in
             guard let commutes = weeklyData[day], !commutes.isEmpty else { return nil }
-            let averageScore = commutes.map { Double($0.drivingMetrics.drivingScore) }.reduce(0, +) / Double(commutes.count)
+            let totalScore = commutes.map { Double($0.drivingMetrics.drivingScore) }.reduce(0, +)
+            let averageScore = totalScore / Double(commutes.count)
+            // Guard against invalid score calculations
+            guard averageScore.isFinite && averageScore >= 0 else { return nil }
             return (day: String(day.prefix(3)), score: averageScore)
         }
         
         guard !chartData.isEmpty else {
             return AnyView(
-                Text("No data available for weekly score trends")
+                Text("No data available for weekly DQI trends")
                     .foregroundColor(.secondary)
                     .font(.caption)
             )
         }
         
         return AnyView(VStack(alignment: .leading, spacing: 8) {
-            Text("Average Score by Day")
+            Text("Average DQI by Day")
                 .font(.subheadline)
                 .fontWeight(.semibold)
             
             Chart(chartData, id: \.day) { data in
                 LineMark(
                     x: .value("Day", data.day),
-                    y: .value("Score", data.score)
+                    y: .value("DQI", data.score)
                 )
                 .foregroundStyle(DesignSystem.Colors.accent)
                 .lineStyle(StrokeStyle(lineWidth: 3))
                 
                 PointMark(
                     x: .value("Day", data.day),
-                    y: .value("Score", data.score)
+                    y: .value("DQI", data.score)
                 )
                 .foregroundStyle(DesignSystem.Colors.accent)
                 .symbol(Circle())
@@ -5048,7 +5967,12 @@ struct ContentView: View {
             if !recentCommutes.isEmpty {
                 Chart(recentCommutes.indices, id: \.self) { index in
                     let commute = recentCommutes[index]
-                    let trafficPercentage = commute.duration > 0 ? (commute.drivingMetrics.slowTrafficTime / commute.duration) * 100 : 0
+                    let trafficPercentage: Double = {
+                        guard commute.duration > 0 else { return 0 }
+                        let percentage = (commute.drivingMetrics.slowTrafficTime / commute.duration) * 100
+                        guard percentage.isFinite && percentage >= 0 else { return 0 }
+                        return min(percentage, 100) // Cap at 100%
+                    }()
                     
                     AreaMark(
                         x: .value("Trip", index + 1),
@@ -5199,485 +6123,625 @@ struct ContentView: View {
     }
     
     // MARK: - Settings View
-    func SettingsView() -> some View {
-        NavigationView {
-            ScrollView {
-                LazyVStack(spacing: DesignSystem.Spacing.lg) {
-                    // Driving Preferences Section
-                    CardView {
-                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
-                            HStack {
-                                Label {
-                                    Text("Driving Preferences")
-                                        .font(DesignSystem.Typography.title3)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                } icon: {
-                                    Image(systemName: "car.fill")
-                                        .foregroundColor(DesignSystem.Colors.primary)
-                                }
-                                
-                                Spacer()
-                            }
+    private func drivingPreferencesSection() -> some View {
+        CardView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                HStack {
+                    Label {
+                        Text("Driving Preferences")
+                            .font(DesignSystem.Typography.title3)
+                            .foregroundColor(DesignSystem.Colors.text)
+                    } icon: {
+                        Image(systemName: "car.fill")
+                            .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
+                    Spacer()
+                }
+                
+                HStack(spacing: DesignSystem.Spacing.md) {
+                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                        Text("Speed Limit")
+                            .font(DesignSystem.Typography.headline)
+                            .foregroundColor(DesignSystem.Colors.text)
+                        
+                        Text("Speed violations detected above this limit")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    
+                    Spacer()
+                    
+                    HStack(spacing: DesignSystem.Spacing.xs) {
+                        Button(action: {
+                            let newValue = max(30, settingsManager.speedLimitThreshold - 5)
+                            settingsManager.saveSpeedLimit(newValue)
+                        }) {
+                            Image(systemName: "minus.circle.fill")
+                                .font(.title2)
+                                .foregroundColor(DesignSystem.Colors.primary)
+                        }
+                        .disabled(settingsManager.speedLimitThreshold <= 30)
+                        .buttonStyle(.plain)
+                        
+                        VStack(spacing: 1) {
+                            Text("\(Int(settingsManager.speedLimitThreshold))")
+                                .font(DesignSystem.Typography.title3)
+                                .foregroundColor(DesignSystem.Colors.primary)
+                                .fontWeight(.bold)
                             
-                            HStack(spacing: DesignSystem.Spacing.md) {
-                                VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                                    Text("Speed Limit")
-                                        .font(DesignSystem.Typography.headline)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                    
-                                    Text("Speed violations detected above this limit")
-                                        .font(DesignSystem.Typography.caption)
-                                        .foregroundColor(DesignSystem.Colors.secondaryText)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                                
-                                Spacer()
-                                
-                                HStack(spacing: DesignSystem.Spacing.xs) {
-                                    Button(action: {
-                                        let newValue = max(30, settingsManager.speedLimitThreshold - 5)
-                                        settingsManager.speedLimitThreshold = newValue
-                                        settingsManager.saveSpeedLimit(newValue)
-                                    }) {
-                                        Image(systemName: "minus.circle.fill")
-                                            .font(.title2)
-                                            .foregroundColor(DesignSystem.Colors.primary)
-                                    }
-                                    .disabled(settingsManager.speedLimitThreshold <= 30)
-                                    
-                                    VStack(spacing: 1) {
-                                        Text("\(Int(settingsManager.speedLimitThreshold))")
-                                            .font(DesignSystem.Typography.title3)
-                                            .foregroundColor(DesignSystem.Colors.primary)
-                                            .fontWeight(.bold)
-                                        
-                                        Text("km/h")
-                                            .font(.caption2)
-                                            .foregroundColor(DesignSystem.Colors.secondaryText)
-                                            .fontWeight(.medium)
-                                    }
-                                    .frame(minWidth: 50)
-                                    .padding(.horizontal, DesignSystem.Spacing.xs)
-                                    .padding(.vertical, 4)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                            .fill(DesignSystem.Colors.primary.opacity(0.1))
-                                    )
-                                    
-                                    Button(action: {
-                                        let newValue = min(150, settingsManager.speedLimitThreshold + 5)
-                                        settingsManager.speedLimitThreshold = newValue
-                                        settingsManager.saveSpeedLimit(newValue)
-                                    }) {
-                                        Image(systemName: "plus.circle.fill")
-                                            .font(.title2)
-                                            .foregroundColor(DesignSystem.Colors.primary)
-                                    }
-                                    .disabled(settingsManager.speedLimitThreshold >= 150)
-                                }
+                            Text("km/h")
+                                .font(.caption2)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                                .fontWeight(.medium)
+                        }
+                        .frame(minWidth: 50)
+                        .padding(.horizontal, DesignSystem.Spacing.xs)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                .fill(DesignSystem.Colors.primary.opacity(0.1))
+                        )
+                        
+                        Button(action: {
+                            let newValue = min(150, settingsManager.speedLimitThreshold + 5)
+                            settingsManager.saveSpeedLimit(newValue)
+                        }) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.title2)
+                                .foregroundColor(DesignSystem.Colors.primary)
+                        }
+                        .disabled(settingsManager.speedLimitThreshold >= 150)
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(DesignSystem.Spacing.sm)
+                .background(
+                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                        .fill(DesignSystem.Colors.cardBackground)
+                        .shadow(color: DesignSystem.Shadow.light, radius: 1, x: 0, y: 1)
+                )
+                
+                VStack(spacing: DesignSystem.Spacing.md) {
+                    SettingToggle(
+                        title: "Keep Screen On During Trips",
+                        description: "Prevent device from sleeping while tracking",
+                        isOn: $settingsManager.keepScreenOn,
+                        action: { newValue in
+                            settingsManager.saveKeepScreenOn(newValue)
+                            if isTracking {
+                                UIApplication.shared.isIdleTimerDisabled = newValue
                             }
-                            .padding(DesignSystem.Spacing.sm)
+                        }
+                    )
+                    
+                    SettingToggle(
+                        title: "Smart Trip Ordering",
+                        description: "Order trips by location relevance and history",
+                        isOn: $settingsManager.useLocationBasedOrdering,
+                        action: { newValue in
+                            settingsManager.saveLocationOrdering(newValue)
+                        }
+                    )
+                }
+                
+                // Auto-End Time Control
+                HStack(spacing: DesignSystem.Spacing.md) {
+                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                        Text("Auto-End Trips")
+                            .font(DesignSystem.Typography.headline)
+                            .foregroundColor(DesignSystem.Colors.text)
+                        
+                        Text("Automatically end trips after being at the same location for this long")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    
+                    Spacer()
+                    
+                    HStack(spacing: DesignSystem.Spacing.xs) {
+                        Button(action: {
+                            let newValue = max(1.0, settingsManager.autoEndTimeHours - 0.5)
+                            settingsManager.saveAutoEndTime(newValue)
+                        }) {
+                            Image(systemName: "minus.circle.fill")
+                                .font(.title2)
+                                .foregroundColor(DesignSystem.Colors.primary)
+                        }
+                        .disabled(settingsManager.autoEndTimeHours <= 1.0)
+                        .buttonStyle(.plain)
+                        
+                        VStack(spacing: 1) {
+                            Text(settingsManager.autoEndTimeHours == floor(settingsManager.autoEndTimeHours) ? 
+                                 "\(Int(settingsManager.autoEndTimeHours))" : 
+                                 String(format: "%.1f", settingsManager.autoEndTimeHours))
+                                .font(DesignSystem.Typography.title3)
+                                .foregroundColor(DesignSystem.Colors.primary)
+                                .fontWeight(.bold)
+                            
+                            Text("hours")
+                                .font(.caption2)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                                .fontWeight(.medium)
+                        }
+                        .frame(minWidth: 50)
+                        .padding(.horizontal, DesignSystem.Spacing.xs)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                .fill(DesignSystem.Colors.primary.opacity(0.1))
+                        )
+                        
+                        Button(action: {
+                            let newValue = min(12.0, settingsManager.autoEndTimeHours + 0.5)
+                            settingsManager.saveAutoEndTime(newValue)
+                        }) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.title2)
+                                .foregroundColor(DesignSystem.Colors.primary)
+                        }
+                        .disabled(settingsManager.autoEndTimeHours >= 12.0)
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(DesignSystem.Spacing.sm)
+                .background(
+                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                        .fill(DesignSystem.Colors.cardBackground)
+                        .shadow(color: DesignSystem.Shadow.light, radius: 1, x: 0, y: 1)
+                )
+            }
+        }
+    }
+    
+    private func appPermissionsSection() -> some View {
+        CardView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                HStack {
+                    Label {
+                        Text("Location Permissions")
+                            .font(DesignSystem.Typography.title3)
+                            .foregroundColor(DesignSystem.Colors.text)
+                    } icon: {
+                        Image(systemName: "location.circle.fill")
+                            .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
+                    Spacer()
+                }
+                
+                HStack {
+                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                        Text("Current Status")
+                            .font(DesignSystem.Typography.headline)
+                            .foregroundColor(DesignSystem.Colors.text)
+                        
+                        Text("Required for GPS tracking and trip location data")
+                            .font(DesignSystem.Typography.caption)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                    }
+                    
+                    Spacer()
+                    
+                    Text(authorizationStatusText)
+                        .font(DesignSystem.Typography.callout)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, DesignSystem.Spacing.sm)
+                        .padding(.vertical, DesignSystem.Spacing.xs)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                .fill(authorizationStatusColor)
+                        )
+                }
+                
+                // Only show request button if permission is denied, restricted, or not determined
+                let needsPermission = locationManager.authorizationStatus == .denied || 
+                                    locationManager.authorizationStatus == .restricted || 
+                                    locationManager.authorizationStatus == .notDetermined
+                
+                if needsPermission {
+                    AnimatedButton(action: {
+                        locationManager.requestLocationPermission()
+                    }) {
+                        HStack {
+                            Image(systemName: "location.fill.viewfinder")
+                                .font(.headline)
+                            
+                            Text("Request Location Permission")
+                                .font(DesignSystem.Typography.headline)
+                                .fontWeight(.medium)
+                        }
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(DesignSystem.Spacing.md)
+                        .background(DesignSystem.Colors.primary)
+                        .cornerRadius(DesignSystem.CornerRadius.md)
+                    }
+                } else {
+                    // Show helpful message when permission is already granted
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.title2)
+                        
+                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                            Text("Permission Granted")
+                                .font(DesignSystem.Typography.headline)
+                                .foregroundColor(.green)
+                            
+                            Text("Location services are enabled for trip tracking")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                        }
+                        
+                        Spacer()
+                    }
+                    .padding(DesignSystem.Spacing.md)
+                    .background(Color.green.opacity(0.1))
+                    .cornerRadius(DesignSystem.CornerRadius.md)
+                }
+            }
+        }
+    }
+    
+    private func sensorPreferencesSection() -> some View {
+        CardView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                HStack {
+                    Label {
+                        Text("Sensor Preferences")
+                            .font(DesignSystem.Typography.title3)
+                            .foregroundColor(DesignSystem.Colors.text)
+                    } icon: {
+                        Image(systemName: "sensor.fill")
+                            .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
+                    Spacer()
+                }
+                
+                VStack(spacing: DesignSystem.Spacing.md) {
+                    SettingToggle(
+                        title: "GPS Tracking",
+                        description: "Record trip routes, distances, and speed data",
+                        isOn: $settingsManager.enableGPS,
+                        action: { newValue in
+                            settingsManager.saveGPSSetting(newValue)
+                        }
+                    )
+                    
+                    SettingToggle(
+                        title: "Motion Sensors",
+                        description: "Detect braking, acceleration, and rough road conditions",
+                        isOn: $settingsManager.enableMotionSensors,
+                        action: { newValue in
+                            settingsManager.saveMotionSensorsSetting(newValue)
+                        }
+                    )
+                    
+                    SettingToggle(
+                        title: "Microphone",
+                        description: "Detect horns and sirens for safety analysis",
+                        isOn: $settingsManager.enableMicrophone,
+                        action: { newValue in
+                            settingsManager.saveMicrophoneSetting(newValue)
+                        }
+                    )
+                }
+                
+                // Info about sensor usage
+                HStack {
+                    Image(systemName: "info.circle")
+                        .foregroundColor(DesignSystem.Colors.primary)
+                    
+                    Text("Disabled sensors will reduce battery usage but limit trip analysis features.")
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(DesignSystem.Spacing.sm)
+                .background(
+                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                        .fill(DesignSystem.Colors.primary.opacity(0.1))
+                )
+            }
+        }
+    }
+    
+    private func dataManagementSection() -> some View {
+        CardView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                HStack {
+                    Label {
+                        Text("Data Management")
+                            .font(DesignSystem.Typography.title3)
+                            .foregroundColor(DesignSystem.Colors.text)
+                    } icon: {
+                        Image(systemName: "externaldrive.fill")
+                            .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
+                    Spacer()
+                }
+                
+                VStack(spacing: DesignSystem.Spacing.md) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                            Text("Backup & Restore")
+                                .font(DesignSystem.Typography.headline)
+                                .foregroundColor(DesignSystem.Colors.text)
+                            
+                            Text("Export your trips and settings or restore from a backup")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                        }
+                        
+                        Spacer()
+                        
+                        Text("\(commuteTracker.commutes.count)")
+                            .font(DesignSystem.Typography.callout)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                            .padding(.horizontal, DesignSystem.Spacing.sm)
+                            .padding(.vertical, DesignSystem.Spacing.xs)
                             .background(
                                 RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                    .fill(DesignSystem.Colors.cardBackground)
-                                    .shadow(color: DesignSystem.Shadow.light, radius: 1, x: 0, y: 1)
+                                    .fill(DesignSystem.Colors.background)
                             )
-                            
-                            VStack(spacing: DesignSystem.Spacing.md) {
-                                SettingToggle(
-                                    title: "Keep Screen On During Trips",
-                                    description: "Prevent device from sleeping while tracking",
-                                    isOn: $settingsManager.keepScreenOn,
-                                    action: { newValue in
-                                        settingsManager.saveKeepScreenOn(newValue)
-                                        if isTracking {
-                                            UIApplication.shared.isIdleTimerDisabled = newValue
-                                        }
-                                    }
-                                )
-                                
-                                SettingToggle(
-                                    title: "Smart Trip Ordering",
-                                    description: "Order trips by location relevance and history",
-                                    isOn: $settingsManager.useLocationBasedOrdering,
-                                    action: { newValue in
-                                        settingsManager.saveLocationOrdering(newValue)
-                                    }
-                                )
-                            }
-                        }
                     }
                     
-                    // Location Permissions Section
-                    CardView {
-                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                    VStack(spacing: DesignSystem.Spacing.sm) {
+                        // Export Button
+                        AnimatedButton(action: {
+                            if let data = commuteTracker.exportAllData() {
+                                let filename = "MyCommute_Backup_\(DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .none).replacingOccurrences(of: "/", with: "_")).json"
+                                shareData(data, filename: filename)
+                            }
+                        }) {
                             HStack {
-                                Label {
-                                    Text("Location Permissions")
-                                        .font(DesignSystem.Typography.title3)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                } icon: {
-                                    Image(systemName: "location.circle.fill")
-                                        .foregroundColor(DesignSystem.Colors.primary)
-                                }
-                                
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.subheadline)
+                                Text("Export Data")
+                                    .font(DesignSystem.Typography.subheadline)
+                                    .fontWeight(.medium)
                                 Spacer()
                             }
-                            
-                            HStack {
-                                VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                                    Text("Current Status")
-                                        .font(DesignSystem.Typography.headline)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                    
-                                    Text("Required for GPS tracking and trip location data")
-                                        .font(DesignSystem.Typography.caption)
-                                        .foregroundColor(DesignSystem.Colors.secondaryText)
-                                }
-                                
-                                Spacer()
-                                
-                                Text(authorizationStatusText)
-                                    .font(DesignSystem.Typography.callout)
-                                    .fontWeight(.semibold)
-                                    .foregroundColor(.white)
-                                    .padding(.horizontal, DesignSystem.Spacing.sm)
-                                    .padding(.vertical, DesignSystem.Spacing.xs)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                            .fill(authorizationStatusColor)
-                                    )
-                            }
-                            
-                            // Only show request button if permission is denied, restricted, or not determined
-                            let needsPermission = locationManager.authorizationStatus == .denied || 
-                                                locationManager.authorizationStatus == .restricted || 
-                                                locationManager.authorizationStatus == .notDetermined
-                            
-                            if needsPermission {
-                                AnimatedButton(action: {
-                                    locationManager.requestLocationPermission()
-                                }) {
-                                    HStack {
-                                        Image(systemName: "location.fill.viewfinder")
-                                            .font(.headline)
-                                        
-                                        Text("Request Location Permission")
-                                            .font(DesignSystem.Typography.headline)
-                                            .fontWeight(.medium)
-                                    }
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(DesignSystem.Spacing.md)
-                                    .background(DesignSystem.Colors.primary)
-                                    .cornerRadius(DesignSystem.CornerRadius.md)
-                                }
-                            } else {
-                                // Show helpful message when permission is already granted
-                                HStack {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundColor(.green)
-                                        .font(.title2)
-                                    
-                                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                                        Text("Permission Granted")
-                                            .font(DesignSystem.Typography.headline)
-                                            .foregroundColor(.green)
-                                        
-                                        Text("Location services are enabled for trip tracking")
-                                            .font(DesignSystem.Typography.caption)
-                                            .foregroundColor(DesignSystem.Colors.secondaryText)
-                                    }
-                                    
-                                    Spacer()
-                                }
-                                .padding(DesignSystem.Spacing.md)
-                                .background(Color.green.opacity(0.1))
-                                .cornerRadius(DesignSystem.CornerRadius.md)
-                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, DesignSystem.Spacing.lg)
+                            .padding(.vertical, DesignSystem.Spacing.md)
+                            .background(
+                                RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
+                                    .fill(DesignSystem.Colors.primary)
+                            )
                         }
+                        
+                        // Import Button
+                        Menu {
+                            Button(action: {
+                                showDocumentPicker = true
+                            }) {
+                                Label("Import Backup (JSON)", systemImage: "doc.text")
+                            }
+                            
+                            Button(action: {
+                                showCSVImporter = true
+                            }) {
+                                Label("Import CSV Data", systemImage: "tablecells")
+                            }
+                        } label: {
+                            HStack {
+                                Image(systemName: "square.and.arrow.down")
+                                    .font(.subheadline)
+                                Text("Import Data")
+                                    .font(DesignSystem.Typography.subheadline)
+                                    .fontWeight(.medium)
+                                Spacer()
+                            }
+                            .foregroundColor(DesignSystem.Colors.primary)
+                            .padding(.horizontal, DesignSystem.Spacing.lg)
+                            .padding(.vertical, DesignSystem.Spacing.md)
+                            .background(
+                                RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
+                                    .fill(DesignSystem.Colors.primary.opacity(0.1))
+                            )
+                        }
+                        
+                        Spacer()
+                    }
+                }
+            }
+        }
+    }
+    
+    private func aboutSection() -> some View {
+        CardView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                HStack {
+                    Label {
+                        Text("About Time To Go")
+                            .font(DesignSystem.Typography.title3)
+                            .foregroundColor(DesignSystem.Colors.text)
+                    } icon: {
+                        Image(systemName: "info.circle.fill")
+                            .foregroundColor(DesignSystem.Colors.primary)
                     }
                     
-                    // Sensor Preferences Section
-                    CardView {
-                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                    Spacer()
+                }
+                
+                VStack(spacing: DesignSystem.Spacing.md) {
+                    HStack {
+                        Text("Version")
+                            .font(DesignSystem.Typography.headline)
+                            .foregroundColor(DesignSystem.Colors.text)
+                        
+                        Spacer()
+                        
+                        Text("1.0")
+                            .font(DesignSystem.Typography.callout)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
+                            .padding(.horizontal, DesignSystem.Spacing.sm)
+                            .padding(.vertical, DesignSystem.Spacing.xs)
+                            .background(
+                                RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                    .fill(DesignSystem.Colors.background)
+                            )
+                    }
+                    
+                    Text("Track your daily commutes with GPS precision, analyze driving patterns, and get personalized recommendations.")
+                        .font(DesignSystem.Typography.caption)
+                        .foregroundColor(DesignSystem.Colors.secondaryText)
+                        .multilineTextAlignment(.leading)
+                    
+                    Divider()
+                        .background(DesignSystem.Colors.borderColor)
+                    
+                    // Algorithm explanation links
+                    VStack(spacing: DesignSystem.Spacing.sm) {
+                        Button(action: {
+                            showDriveQualityExplanation = true
+                        }) {
                             HStack {
-                                Label {
-                                    Text("Sensor Preferences")
-                                        .font(DesignSystem.Typography.title3)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                } icon: {
-                                    Image(systemName: "sensor.fill")
-                                        .foregroundColor(DesignSystem.Colors.primary)
-                                }
-                                
-                                Spacer()
-                            }
-                            
-                            VStack(spacing: DesignSystem.Spacing.md) {
-                                SettingToggle(
-                                    title: "GPS Tracking",
-                                    description: "Record trip routes, distances, and speed data",
-                                    isOn: $settingsManager.enableGPS,
-                                    action: { newValue in
-                                        settingsManager.saveGPSSetting(newValue)
-                                    }
-                                )
-                                
-                                SettingToggle(
-                                    title: "Motion Sensors",
-                                    description: "Detect braking, acceleration, and rough road conditions",
-                                    isOn: $settingsManager.enableMotionSensors,
-                                    action: { newValue in
-                                        settingsManager.saveMotionSensorsSetting(newValue)
-                                    }
-                                )
-                                
-                                SettingToggle(
-                                    title: "Microphone",
-                                    description: "Detect horns and sirens for safety analysis",
-                                    isOn: $settingsManager.enableMicrophone,
-                                    action: { newValue in
-                                        settingsManager.saveMicrophoneSetting(newValue)
-                                    }
-                                )
-                            }
-                            
-                            // Info about sensor usage
-                            HStack {
-                                Image(systemName: "info.circle")
+                                Image(systemName: "chart.line.uptrend.xyaxis")
                                     .foregroundColor(DesignSystem.Colors.primary)
+                                    .frame(width: 20)
                                 
-                                Text("Disabled sensors will reduce battery usage but limit trip analysis features.")
+                                Text("How Drive Quality is Calculated")
+                                    .font(DesignSystem.Typography.subheadline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+                                
+                                Spacer()
+                                
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                            }
+                            .padding(.vertical, DesignSystem.Spacing.xs)
+                        }
+                        .buttonStyle(.plain)
+                        
+                        Button(action: {
+                            showDepartureTimeExplanation = true
+                        }) {
+                            HStack {
+                                Image(systemName: "clock.arrow.circlepath")
+                                    .foregroundColor(DesignSystem.Colors.primary)
+                                    .frame(width: 20)
+                                
+                                Text("How We Find the Best Time to Leave")
+                                    .font(DesignSystem.Typography.subheadline)
+                                    .foregroundColor(DesignSystem.Colors.text)
+                                
+                                Spacer()
+                                
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundColor(DesignSystem.Colors.secondaryText)
+                            }
+                            .padding(.vertical, DesignSystem.Spacing.xs)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+    
+    private func dangerZoneSection() -> some View {
+        CardView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                HStack {
+                    Label {
+                        Text("Danger Zone")
+                            .font(DesignSystem.Typography.title3)
+                            .foregroundColor(.red)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.red)
+                    }
+                    
+                    Spacer()
+                }
+                
+                VStack(spacing: DesignSystem.Spacing.md) {
+                    Button(action: {
+                        showDeleteAllAlert = true
+                    }) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                                Text("Delete All Trip Data")
+                                    .font(DesignSystem.Typography.headline)
+                                    .foregroundColor(.red)
+                                
+                                Text("Permanently removes all trip history and data")
                                     .font(DesignSystem.Typography.caption)
                                     .foregroundColor(DesignSystem.Colors.secondaryText)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
-                            .padding(DesignSystem.Spacing.sm)
-                            .background(
-                                RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                    .fill(DesignSystem.Colors.primary.opacity(0.1))
-                            )
-                        }
-                    }
-                    
-                    // Data Management Section
-                    CardView {
-                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
-                            HStack {
-                                Label {
-                                    Text("Data Management")
-                                        .font(DesignSystem.Typography.title3)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                } icon: {
-                                    Image(systemName: "externaldrive.fill")
-                                        .foregroundColor(DesignSystem.Colors.primary)
-                                }
-                                
-                                Spacer()
-                            }
                             
-                            VStack(spacing: DesignSystem.Spacing.md) {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                                        Text("Backup & Restore")
-                                            .font(DesignSystem.Typography.headline)
-                                            .foregroundColor(DesignSystem.Colors.text)
-                                        
-                                        Text("Export your trips and settings or restore from a backup")
-                                            .font(DesignSystem.Typography.caption)
-                                            .foregroundColor(DesignSystem.Colors.secondaryText)
-                                    }
-                                    
-                                    Spacer()
-                                    
-                                    Text("\(commuteTracker.commutes.count)")
-                                        .font(DesignSystem.Typography.callout)
-                                        .foregroundColor(DesignSystem.Colors.secondaryText)
-                                        .padding(.horizontal, DesignSystem.Spacing.sm)
-                                        .padding(.vertical, DesignSystem.Spacing.xs)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                                .fill(DesignSystem.Colors.background)
-                                        )
-                                }
-                                
-                                VStack(spacing: DesignSystem.Spacing.sm) {
-                                    // Export Button
-                                    AnimatedButton(action: {
-                                        if let data = commuteTracker.exportAllData() {
-                                            let filename = "MyCommute_Backup_\(DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .none).replacingOccurrences(of: "/", with: "_")).json"
-                                            shareData(data, filename: filename)
-                                        }
-                                    }) {
-                                        HStack {
-                                            Image(systemName: "square.and.arrow.up")
-                                                .font(.subheadline)
-                                            Text("Export Data")
-                                                .font(DesignSystem.Typography.subheadline)
-                                                .fontWeight(.medium)
-                                            Spacer()
-                                        }
-                                        .foregroundColor(.white)
-                                        .padding(.horizontal, DesignSystem.Spacing.lg)
-                                        .padding(.vertical, DesignSystem.Spacing.md)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
-                                                .fill(DesignSystem.Colors.primary)
-                                        )
-                                    }
-                                    
-                                    // Import Button
-                                    Menu {
-                                        Button(action: {
-                                            showDocumentPicker = true
-                                        }) {
-                                            Label("Import Backup (JSON)", systemImage: "doc.text")
-                                        }
-                                        
-                                        Button(action: {
-                                            showCSVImporter = true
-                                        }) {
-                                            Label("Import CSV Data", systemImage: "tablecells")
-                                        }
-                                    } label: {
-                                        HStack {
-                                            Image(systemName: "square.and.arrow.down")
-                                                .font(.subheadline)
-                                            Text("Import Data")
-                                                .font(DesignSystem.Typography.subheadline)
-                                                .fontWeight(.medium)
-                                            Spacer()
-                                        }
-                                        .foregroundColor(DesignSystem.Colors.primary)
-                                        .padding(.horizontal, DesignSystem.Spacing.lg)
-                                        .padding(.vertical, DesignSystem.Spacing.md)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.md)
-                                                .fill(DesignSystem.Colors.primary.opacity(0.1))
-                                        )
-                                    }
-                                    
-                                    Spacer()
-                                }
-                            }
+                            Spacer()
+                            
+                            Image(systemName: "trash")
+                                .foregroundColor(.red)
                         }
+                        .padding(DesignSystem.Spacing.sm)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                .fill(Color.red.opacity(0.05))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                        .stroke(Color.red.opacity(0.2), lineWidth: 1)
+                                )
+                        )
                     }
-                    
-                    // iCloud Sync Status Section
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+    
+    private func attributionSection() -> some View {
+        VStack(spacing: DesignSystem.Spacing.xs) {
+            Text("Made for and by Rohan Manthani")
+                .font(DesignSystem.Typography.caption)
+                .foregroundColor(DesignSystem.Colors.secondaryText.opacity(0.7))
+        }
+        .padding(.top, DesignSystem.Spacing.lg)
+    }
+    
+    func SettingsView() -> some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: DesignSystem.Spacing.lg) {
+                    drivingPreferencesSection()
+                    appPermissionsSection()
+                    sensorPreferencesSection()
+                    dataManagementSection()
                     iCloudSyncSection
-                    
-                    
-                    // About Section
-                    CardView {
-                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
-                            HStack {
-                                Label {
-                                    Text("About Time To Go")
-                                        .font(DesignSystem.Typography.title3)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                } icon: {
-                                    Image(systemName: "info.circle.fill")
-                                        .foregroundColor(DesignSystem.Colors.primary)
-                                }
-                                
-                                Spacer()
-                            }
-                            
-                            VStack(spacing: DesignSystem.Spacing.md) {
-                                HStack {
-                                    Text("Version")
-                                        .font(DesignSystem.Typography.headline)
-                                        .foregroundColor(DesignSystem.Colors.text)
-                                    
-                                    Spacer()
-                                    
-                                    Text("1.0")
-                                        .font(DesignSystem.Typography.callout)
-                                        .foregroundColor(DesignSystem.Colors.secondaryText)
-                                        .padding(.horizontal, DesignSystem.Spacing.sm)
-                                        .padding(.vertical, DesignSystem.Spacing.xs)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                                .fill(DesignSystem.Colors.background)
-                                        )
-                                }
-                                
-                                Text("Track your daily commutes with GPS precision, analyze driving patterns, and get personalized recommendations.")
-                                    .font(DesignSystem.Typography.caption)
-                                    .foregroundColor(DesignSystem.Colors.secondaryText)
-                                    .multilineTextAlignment(.leading)
-                                
-                                Divider()
-                                    .background(DesignSystem.Colors.borderColor)
-                                
-                                // Algorithm explanation links
-                                VStack(spacing: DesignSystem.Spacing.sm) {
-                                    Button(action: {
-                                        showDriveQualityExplanation = true
-                                    }) {
-                                        HStack {
-                                            Image(systemName: "chart.line.uptrend.xyaxis")
-                                                .foregroundColor(DesignSystem.Colors.primary)
-                                                .frame(width: 20)
-                                            
-                                            Text("How Drive Quality is Calculated")
-                                                .font(DesignSystem.Typography.subheadline)
-                                                .foregroundColor(DesignSystem.Colors.text)
-                                            
-                                            Spacer()
-                                            
-                                            Image(systemName: "chevron.right")
-                                                .font(.caption)
-                                                .foregroundColor(DesignSystem.Colors.secondaryText)
-                                        }
-                                        .padding(.vertical, DesignSystem.Spacing.xs)
-                                    }
-                                    .buttonStyle(.plain)
-                                    
-                                    Button(action: {
-                                        showDepartureTimeExplanation = true
-                                    }) {
-                                        HStack {
-                                            Image(systemName: "clock.arrow.circlepath")
-                                                .foregroundColor(DesignSystem.Colors.primary)
-                                                .frame(width: 20)
-                                            
-                                            Text("How We Find the Best Time to Leave")
-                                                .font(DesignSystem.Typography.subheadline)
-                                                .foregroundColor(DesignSystem.Colors.text)
-                                            
-                                            Spacer()
-                                            
-                                            Image(systemName: "chevron.right")
-                                                .font(.caption)
-                                                .foregroundColor(DesignSystem.Colors.secondaryText)
-                                        }
-                                        .padding(.vertical, DesignSystem.Spacing.xs)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Attribution
-                    VStack(spacing: DesignSystem.Spacing.xs) {
-                        Text("Made for and by Rohan Manthani")
-                            .font(DesignSystem.Typography.caption)
-                            .foregroundColor(DesignSystem.Colors.secondaryText.opacity(0.7))
-                    }
-                    .padding(.top, DesignSystem.Spacing.lg)
+                    aboutSection()
+                    dangerZoneSection()
+                    attributionSection()
                 }
                 .padding(DesignSystem.Spacing.md)
             }
             .background(DesignSystem.Colors.background)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.large)
+            .navigationViewStyle(StackNavigationViewStyle())
+            .alert("Delete All Trip Data", isPresented: $showDeleteAllAlert) {
+                Button("Cancel", role: .cancel) { }
+                Button("Delete All", role: .destructive) {
+                    commuteTracker.deleteAllCommutes()
+                }
+            } message: {
+                Text("This will permanently delete all your trip history and data. This action cannot be undone.")
+            }
         }
     }
     
-    private var authorizationStatusText: String {
+    var authorizationStatusText: String {
         switch locationManager.authorizationStatus {
         case .notDetermined: return "Not Determined"
         case .denied: return "Denied"
@@ -5688,7 +6752,7 @@ struct ContentView: View {
         }
     }
     
-    private var authorizationStatusColor: Color {
+    var authorizationStatusColor: Color {
         switch locationManager.authorizationStatus {
         case .authorizedAlways, .authorizedWhenInUse: return .green
         case .denied, .restricted: return .red
@@ -5697,13 +6761,14 @@ struct ContentView: View {
         }
     }
     
-    private func relativeDateString(from date: Date) -> String {
+    
+    func relativeDateString(from date: Date) -> String {
         let formatter = RelativeDateTimeFormatter()
         formatter.dateTimeStyle = .named
         return formatter.localizedString(for: date, relativeTo: Date())
     }
     
-    private var iCloudSyncSection: some View {
+    var iCloudSyncSection: some View {
         CardView {
             VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
                 HStack {
@@ -5792,110 +6857,6 @@ struct ContentView: View {
     }
     
     // MARK: - Trip Detail View
-    func TripDetailView(commute: CommuteRecord) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Traffic Analysis
-            Text("Traffic Analysis")
-                .font(.headline)
-                .foregroundColor(.primary)
-                
-                // Slow Traffic Time Summary
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Image(systemName: "clock.fill")
-                                .foregroundColor(.red)
-                            Text("Time in Slow Traffic (<15 km/h)")
-                                .font(.subheadline)
-                                .fontWeight(.medium)
-                        }
-                        
-                        Text(formatSlowTrafficDisplayTime(commute.drivingMetrics.slowTrafficTime, totalTripDuration: commute.duration))
-                            .font(.title2)
-                            .fontWeight(.bold)
-                            .foregroundColor(.red)
-                    }
-                    
-                    Spacer()
-                }
-                .padding(.vertical, 8)
-                .padding(.horizontal, 12)
-                .background(Color(.systemGray6))
-                .cornerRadius(8)
-                
-                // Heavy Traffic Periods Detail
-                if !commute.heavyTrafficPeriods.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Image(systemName: "car.fill")
-                                .foregroundColor(.orange)
-                            Text("\(commute.heavyTrafficPeriods.count) heavy traffic period\(commute.heavyTrafficPeriods.count == 1 ? "" : "s") detected")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-                    
-                        ForEach(Array(commute.heavyTrafficPeriods.enumerated()), id: \.offset) { index, period in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Period \(index + 1): \(period.formattedDuration)")
-                                        .font(.caption)
-                                        .fontWeight(.semibold)
-                                    Text("Avg Speed: \(String(format: "%.1f", period.averageSpeed)) km/h")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                Text(CommuteRecord.timeFormatter.string(from: period.startTime))
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                            }
-                            .padding(.vertical, 2)
-                        }
-                    }
-                    .padding(.vertical, 8)
-                    .padding(.horizontal, 12)
-                    .background(Color(.systemGray6))
-                    .cornerRadius(8)
-                }
-            
-            if !commute.pathPoints.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Route Map")
-                        .font(.headline)
-                        .foregroundColor(.primary)
-                    
-                    // Speed Legend
-                    SpeedLegendView()
-                    
-                    Button(action: {
-                        fullScreenMapCommute = commute
-                    }) {
-                        TripMapView(commute: commute)
-                            .frame(height: 200)
-                            .cornerRadius(12)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.blue.opacity(0.3), lineWidth: 1)
-                            )
-                            .overlay(
-                                VStack {
-                                    Spacer()
-                                    HStack {
-                                        Spacer()
-                                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                            .font(.title2)
-                                            .foregroundColor(.white)
-                                            .background(Circle().fill(Color.black.opacity(0.6)).frame(width: 32, height: 32))
-                                            .padding(8)
-                                    }
-                                }
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-    }
     
     // MARK: - Full Screen Map View
     func FullScreenMapView(commute: CommuteRecord) -> some View {
@@ -5905,10 +6866,23 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(tripManager.availableTrips.first(where: { $0.id == commute.type.id })?.displayName ?? commute.type.displayName)
-                                .font(.title2)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.primary)
+                            HStack(spacing: 8) {
+                                // Trip type indicator - just icon
+                                if commute.type.isOneOff {
+                                    Image(systemName: "location.circle")
+                                        .font(.caption)
+                                        .foregroundColor(.orange)
+                                } else {
+                                    Image(systemName: "repeat.circle")
+                                        .font(.caption)
+                                        .foregroundColor(.blue)
+                                }
+                                
+                                Text(tripManager.availableTrips.first(where: { $0.id == commute.type.id })?.displayName ?? commute.type.displayName)
+                                    .font(.title2)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.primary)
+                            }
                             
                             Text("\(commute.formattedDate) • \(commute.formattedDuration)")
                                 .font(.subheadline)
@@ -5918,26 +6892,9 @@ struct ContentView: View {
                         Spacer()
                         
                         // Event toggle controls
-                        Menu {
-                            Toggle("Show Events", isOn: $showDrivingEvents)
-                            
-                            if showDrivingEvents {
-                                Divider()
-                                
-                                ForEach(DrivingEvent.EventType.allCases, id: \.self) { eventType in
-                                    Toggle(eventType.displayName, isOn: Binding(
-                                        get: { visibleEventTypes.contains(eventType) },
-                                        set: { isOn in
-                                            if isOn {
-                                                visibleEventTypes.insert(eventType)
-                                            } else {
-                                                visibleEventTypes.remove(eventType)
-                                            }
-                                        }
-                                    ))
-                                }
-                            }
-                        } label: {
+                        Button(action: {
+                            showEventFilterSheet = true
+                        }) {
                             HStack(spacing: 4) {
                                 Image(systemName: showDrivingEvents ? "eye.fill" : "eye.slash")
                                     .font(.caption)
@@ -5988,9 +6945,67 @@ struct ContentView: View {
                 }
             }
         }
+        .sheet(isPresented: $showEventFilterSheet) {
+            EventFilterSheet(
+                showDrivingEvents: $showDrivingEvents,
+                visibleEventTypes: $visibleEventTypes
+            )
+        }
         .onAppear {
         }
         .onDisappear {
+        }
+    }
+    
+    // MARK: - Event Filter Sheet
+    struct EventFilterSheet: View {
+        @Binding var showDrivingEvents: Bool
+        @Binding var visibleEventTypes: Set<DrivingEvent.EventType>
+        @Environment(\.dismiss) private var dismiss
+        
+        var body: some View {
+            NavigationView {
+                VStack(spacing: 20) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Toggle("Show Events", isOn: $showDrivingEvents)
+                            .font(.headline)
+                        
+                        if showDrivingEvents {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Event Types")
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.secondary)
+                                
+                                ForEach(DrivingEvent.EventType.allCases, id: \.self) { eventType in
+                                    Toggle(eventType.displayName, isOn: Binding(
+                                        get: { visibleEventTypes.contains(eventType) },
+                                        set: { isOn in
+                                            if isOn {
+                                                visibleEventTypes.insert(eventType)
+                                            } else {
+                                                visibleEventTypes.remove(eventType)
+                                            }
+                                        }
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    .padding()
+                    
+                    Spacer()
+                }
+                .navigationTitle("Event Filters")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Done") {
+                            dismiss()
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -6012,7 +7027,7 @@ struct ContentView: View {
         }
     }
     
-    private func createCSVFile() -> URL {
+    func createCSVFile() -> URL {
         let csvContent = commuteTracker.exportToCSV()
         let fileName = "commute-data-\(Date().formatted(date: .abbreviated, time: .omitted)).csv"
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -6027,7 +7042,7 @@ struct ContentView: View {
         return fileURL
     }
     
-    private func createDetailedGPSFile() -> URL {
+    func createDetailedGPSFile() -> URL {
         let csvContent = commuteTracker.exportDetailedGPSData()
         let fileName = "commute-gps-data-\(Date().formatted(date: .abbreviated, time: .omitted)).csv"
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -6043,7 +7058,7 @@ struct ContentView: View {
     }
     
     // MARK: - Smart Trip Ordering
-    private func getSmartOrderedTrips() -> [CommuteType] {
+    func getSmartOrderedTrips() -> [CommuteType] {
         // Check if user has enabled location-based ordering
         guard settingsManager.useLocationBasedOrdering,
               !commuteTracker.commutes.isEmpty,
@@ -6063,7 +7078,7 @@ struct ContentView: View {
         return sortedTrips.map { $0.trip }
     }
     
-    private func calculateTripRelevanceScore(trip: CommuteType, currentLocation: CLLocation) -> Double {
+    func calculateTripRelevanceScore(trip: CommuteType, currentLocation: CLLocation) -> Double {
         // Find all historical trips matching this trip type
         let historicalTrips = commuteTracker.commutes.filter { $0.type.id == trip.id }
         
@@ -6090,7 +7105,7 @@ struct ContentView: View {
             let maxRelevantDistance: Double = 5000 // 5km max relevant distance
             
             if distance <= maxRelevantDistance {
-                // Score decreases exponentially with distance
+                // Rating decreases exponentially with distance
                 let normalizedDistance = distance / maxRelevantDistance
                 let distanceScore = exp(-normalizedDistance * 3) // Exponential decay
                 
@@ -6192,7 +7207,7 @@ struct SplashScreenView: View {
                     )
                 
                 // App Name
-                Text("Rohan's Commute")
+                Text("Time To Go")
                     .font(.largeTitle)
                     .fontWeight(.bold)
                     .foregroundColor(.white)
@@ -6487,25 +7502,52 @@ struct TripMapView: UIViewRepresentable {
         let segmentSize = max(1, min(10, coordinates.count / 20)) // Adaptive segment size
         
         var currentSegmentStart = 0
+        var loopSafetyCounter = 0
+        let maxIterations = coordinates.count * 2 // Safety valve to prevent infinite loops
         
-        while currentSegmentStart < coordinates.count - 1 {
+        while currentSegmentStart < coordinates.count - 1 && loopSafetyCounter < maxIterations {
+            loopSafetyCounter += 1
             let segmentEnd = min(currentSegmentStart + segmentSize, coordinates.count - 1)
             
-            // Calculate average speed for this segment
-            let segmentSpeeds = Array(commute.pathPoints[currentSegmentStart...segmentEnd]).map { $0.speed }
-            let averageSpeed = segmentSpeeds.reduce(0, +) / Double(segmentSpeeds.count)
+            // Calculate average speed for this segment, filtering out invalid values
+            guard segmentEnd < commute.pathPoints.count else {
+                // Safety check: if we're beyond the path points, break out
+                break
+            }
+            
+            let segmentSpeeds = Array(commute.pathPoints[currentSegmentStart...segmentEnd])
+                .map { $0.speed }
+                .filter { $0 >= 0 && $0.isFinite } // Filter out negative and invalid values
+            
+            let averageSpeed: Double
+            if !segmentSpeeds.isEmpty {
+                averageSpeed = segmentSpeeds.reduce(0, +) / Double(segmentSpeeds.count)
+            } else {
+                // If no valid speed data, use 0 (will show as stopped/red)
+                averageSpeed = 0.0
+            }
             
             // Create segment coordinates (ensure we have at least 2 points for a line)
             let endIndex = segmentEnd == currentSegmentStart ? segmentEnd + 1 : segmentEnd
             let segmentCoordinates = Array(coordinates[currentSegmentStart...min(endIndex, coordinates.count - 1)])
             
-            // Create polyline with speed-based styling
+            // Create polyline with speed-based styling (ensure valid coordinates)
+            guard segmentCoordinates.count >= 2 else {
+                // Skip this segment but still advance - always advance at least by 1
+                let nextStart = segmentEnd == currentSegmentStart ? segmentEnd + 1 : segmentEnd
+                currentSegmentStart = max(currentSegmentStart + 1, nextStart)
+                continue
+            }
+            
             let polyline = SpeedPolyline(coordinates: segmentCoordinates, count: segmentCoordinates.count)
             polyline.averageSpeed = averageSpeed
             polyline.speedCategory = SpeedCategory.categorize(speed: averageSpeed)
             mapView.addOverlay(polyline)
             
-            currentSegmentStart = segmentEnd
+            // Ensure overlapping segments for continuous coverage
+            // Always advance at least by 1 to prevent infinite loops
+            let nextStart = segmentEnd == currentSegmentStart ? segmentEnd + 1 : segmentEnd
+            currentSegmentStart = max(currentSegmentStart + 1, nextStart)
         }
     }
     
@@ -6515,6 +7557,8 @@ struct TripMapView: UIViewRepresentable {
                 let renderer = MKPolylineRenderer(polyline: speedPolyline)
                 renderer.strokeColor = speedPolyline.speedCategory.color
                 renderer.lineWidth = speedPolyline.speedCategory.lineWidth
+                renderer.lineCap = .round
+                renderer.lineJoin = .round
                 return renderer
             }
             return MKOverlayRenderer()
@@ -7023,14 +8067,14 @@ struct DriveQualityExplanationView: View {
                         icon: "brain.head.profile",
                         content: {
                             VStack(alignment: .leading, spacing: 12) {
-                                Text("Our drive quality algorithm combines multiple data sources to provide a comprehensive assessment of your driving:")
+                                Text("Our passenger comfort algorithm combines multiple data sources to measure ride enjoyability and comfort:")
                                     .font(.body)
                                 
                                 ForEach([
-                                    "📱 Motion sensors (accelerometer, gyroscope)",
-                                    "🗺️ GPS data (speed, location, route)",
-                                    "🎤 Audio analysis (horn/siren detection)",
-                                    "🚦 Traffic conditions and timing"
+                                    "📱 Motion sensors (detect jarring movements, bumps)",
+                                    "🗺️ GPS data (speed patterns, traffic delays)",
+                                    "🎤 Audio analysis (noise pollution, horns/sirens)",
+                                    "🚦 Stress factors (traffic jams, sudden stops)"
                                 ], id: \.self) { item in
                                     Text(item)
                                         .font(.callout)
@@ -7042,44 +8086,29 @@ struct DriveQualityExplanationView: View {
                     
                     // Scoring Components
                     ExplanationSection(
-                        title: "Scoring Components",
+                        title: "Comfort Factors",
                         icon: "chart.bar.fill",
                         content: {
                             VStack(alignment: .leading, spacing: 16) {
                                 ScoreComponent(
-                                    name: "Smooth Driving",
-                                    weight: "40%",
-                                    description: "Measures sudden accelerations, hard braking, and jerky movements using device motion sensors",
+                                    name: "Ride Comfort",
+                                    weight: "75%",
+                                    description: "Evaluates passenger comfort by detecting jarring braking, bumpy roads, and uncomfortable movements",
                                     color: .green
                                 )
                                 
                                 ScoreComponent(
-                                    name: "Speed Management",
+                                    name: "Stress Factors",
                                     weight: "25%",
-                                    description: "Evaluates adherence to speed limits and consistent speed maintenance",
-                                    color: .blue
-                                )
-                                
-                                ScoreComponent(
-                                    name: "Traffic Adaptation",
-                                    weight: "20%",
-                                    description: "Assesses how well you handle slow traffic and congested conditions",
+                                    description: "Measures stress-inducing factors like excessive speeding, traffic delays, and environmental noise",
                                     color: .orange
                                 )
                                 
-                                ScoreComponent(
-                                    name: "Environmental Awareness",
-                                    weight: "10%",
-                                    description: "Considers phone usage, horn/siren events, and external factors",
-                                    color: .purple
-                                )
-                                
-                                ScoreComponent(
-                                    name: "Route Efficiency",
-                                    weight: "5%",
-                                    description: "Evaluates path optimization and turn smoothness",
-                                    color: .teal
-                                )
+                                Text("Note: Smooth acceleration has minimal impact on passenger comfort and receives very light scoring weight.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .italic()
+                                    .padding(.top, 8)
                             }
                         }
                     )
@@ -7091,12 +8120,13 @@ struct DriveQualityExplanationView: View {
                         content: {
                             VStack(alignment: .leading, spacing: 16) {
                                 TechnicalDetail(
-                                    title: "Motion Analysis",
+                                    title: "Passenger Comfort Analysis",
                                     details: [
                                         "Samples accelerometer data at 50Hz",
                                         "Applies low-pass filter to reduce noise",
-                                        "Detects acceleration spikes > 0.3g",
-                                        "Uses gyroscope for turn smoothness"
+                                        "Detects jarring braking events > 0.5g",
+                                        "Minimally weights smooth acceleration (< 0.3g)",
+                                        "Prioritizes bump and vibration detection"
                                     ]
                                 )
                                 
@@ -7123,32 +8153,32 @@ struct DriveQualityExplanationView: View {
                         }
                     )
                     
-                    // Score Calculation
+                    // Passenger Comfort DQI Calculation
                     ExplanationSection(
-                        title: "Final Score Calculation",
+                        title: "Passenger Comfort Scoring",
                         icon: "function",
                         content: {
                             VStack(alignment: .leading, spacing: 12) {
-                                Text("The final score is calculated using a weighted formula:")
+                                Text("The DQI measures passenger comfort and ride enjoyability using a continuous monitoring system:")
                                     .font(.body)
                                     .fontWeight(.medium)
                                 
                                 VStack(alignment: .leading, spacing: 8) {
-                                    Text("Score = (Smooth × 0.4) + (Speed × 0.25) + (Traffic × 0.2) + (Awareness × 0.1) + (Route × 0.05)")
+                                    Text("DQI = (Comfortable Segments × 75%) + (Smooth Ride × 25%) - Discomfort Events")
                                         .font(.system(.body, design: .monospaced))
                                         .padding()
                                         .background(Color.gray.opacity(0.1))
                                         .cornerRadius(8)
                                     
-                                    Text("Each component is normalized to 0-100, then penalties are applied for:")
+                                    Text("The system continuously evaluates passenger comfort factors:")
                                         .font(.callout)
                                     
                                     ForEach([
-                                        "Hard braking events (-5 points each)",
-                                        "Rapid acceleration (-3 points each)",
-                                        "Phone usage during driving (-10 points)",
-                                        "Excessive time in slow traffic (-2 points per minute)",
-                                        "Horn usage in dense areas (-1 point each)"
+                                        "75% based on smooth, comfortable 30-second segments",
+                                        "25% based on absence of jarring events", 
+                                        "Major penalties: hard braking, bumpy roads, noise, traffic",
+                                        "Minimal penalty: smooth acceleration (not uncomfortable)",
+                                        "Score reflects overall ride enjoyability for passengers"
                                     ], id: \.self) { penalty in
                                         Text("• \(penalty)")
                                             .font(.caption)
@@ -7270,11 +8300,11 @@ struct DepartureTimeExplanationView: View {
                     
                     // Scoring Algorithm
                     ExplanationSection(
-                        title: "Optimal Time Scoring",
+                        title: "Optimal Time Rating",
                         icon: "function",
                         content: {
                             VStack(alignment: .leading, spacing: 16) {
-                                Text("Each 10-minute window receives a score based on:")
+                                Text("Each 10-minute window receives a rating based on:")
                                     .font(.body)
                                     .fontWeight(.medium)
                                 
@@ -7282,7 +8312,7 @@ struct DepartureTimeExplanationView: View {
                                     ScoreFormula(
                                         component: "Average Duration",
                                         weight: "60%",
-                                        description: "Lower trip times score better"
+                                        description: "Lower trip times rate better"
                                     )
                                     
                                     ScoreFormula(
@@ -7296,13 +8326,13 @@ struct DepartureTimeExplanationView: View {
                                     .font(.headline)
                                     .padding(.top, 8)
                                 
-                                Text("Score = avgDuration + (avgTrafficTime × 2.0)")
+                                Text("Rating = avgDuration + (avgTrafficTime × 2.0)")
                                     .font(.system(.body, design: .monospaced))
                                     .padding()
                                     .background(Color.gray.opacity(0.1))
                                     .cornerRadius(8)
                                 
-                                Text("The window with the lowest score is recommended as optimal.")
+                                Text("The window with the lowest rating is recommended as optimal.")
                                     .font(.caption)
                                     .foregroundColor(DesignSystem.Colors.secondaryText)
                                     .italic()
@@ -7324,7 +8354,7 @@ struct DepartureTimeExplanationView: View {
                                         time: "7:00-7:10",
                                         avgDuration: "28 min",
                                         trafficTime: "8 min",
-                                        score: "44.0",
+                                        rating: "44.0",
                                         isOptimal: false
                                     )
                                     
@@ -7332,7 +8362,7 @@ struct DepartureTimeExplanationView: View {
                                         time: "7:10-7:20",
                                         avgDuration: "25 min",
                                         trafficTime: "5 min",
-                                        score: "35.0",
+                                        rating: "35.0",
                                         isOptimal: true
                                     )
                                     
@@ -7340,7 +8370,7 @@ struct DepartureTimeExplanationView: View {
                                         time: "7:20-7:30",
                                         avgDuration: "32 min",
                                         trafficTime: "12 min",
-                                        score: "56.0",
+                                        rating: "56.0",
                                         isOptimal: false
                                     )
                                 }
@@ -7595,7 +8625,7 @@ struct TimeWindowExample: View {
     let time: String
     let avgDuration: String
     let trafficTime: String
-    let score: String
+    let rating: String
     let isOptimal: Bool
     
     var body: some View {
@@ -7612,7 +8642,7 @@ struct TimeWindowExample: View {
                 .font(.caption)
                 .frame(width: 50, alignment: .center)
             
-            Text(score)
+            Text(rating)
                 .font(.system(.caption, design: .monospaced))
                 .frame(width: 40, alignment: .trailing)
             
