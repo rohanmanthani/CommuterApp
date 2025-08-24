@@ -4,6 +4,7 @@ import CoreMotion
 import UIKit
 import MapKit
 import Charts
+import AVFoundation
 
 // MARK: - Utility Functions
 extension DispatchQueue {
@@ -2117,6 +2118,44 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         default:
             break
         }
+    }
+    
+    var microphonePermissionStatus: String {
+        if #available(iOS 17.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted:
+                return "Granted"
+            case .denied:
+                return "Denied"
+            case .undetermined:
+                return "Not Determined"
+            @unknown default:
+                return "Unknown"
+            }
+        } else {
+            switch AVAudioSession.sharedInstance().recordPermission {
+            case .granted:
+                return "Granted"
+            case .denied:
+                return "Denied"
+            case .undetermined:
+                return "Not Determined"
+            @unknown default:
+                return "Unknown"
+            }
+        }
+    }
+    
+    func requestMicrophonePermission() {
+        if #available(iOS 17.0, *) {
+            AVAudioApplication.requestRecordPermission { _ in }
+        } else {
+            AVAudioSession.sharedInstance().requestRecordPermission { _ in }
+        }
+    }
+    
+    var motionSensorPermissionStatus: String {
+        return CMMotionManager().isDeviceMotionAvailable ? "Available" : "Unavailable"
     }
 }
 
@@ -6301,87 +6340,131 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
                 HStack {
                     Label {
-                        Text("Location Permissions")
+                        Text("Permissions")
                             .font(DesignSystem.Typography.title3)
                             .foregroundColor(DesignSystem.Colors.text)
                     } icon: {
-                        Image(systemName: "location.circle.fill")
+                        Image(systemName: "checkmark.shield.fill")
                             .foregroundColor(DesignSystem.Colors.primary)
                     }
                     
                     Spacer()
                 }
                 
-                HStack {
-                    VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                        Text("Current Status")
-                            .font(DesignSystem.Typography.headline)
-                            .foregroundColor(DesignSystem.Colors.text)
-                        
-                        Text("Required for GPS tracking and trip location data")
-                            .font(DesignSystem.Typography.caption)
-                            .foregroundColor(DesignSystem.Colors.secondaryText)
-                    }
-                    
-                    Spacer()
-                    
-                    Text(authorizationStatusText)
-                        .font(DesignSystem.Typography.callout)
-                        .fontWeight(.semibold)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, DesignSystem.Spacing.sm)
-                        .padding(.vertical, DesignSystem.Spacing.xs)
-                        .background(
-                            RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
-                                .fill(authorizationStatusColor)
-                        )
-                }
-                
-                // Only show request button if permission is denied, restricted, or not determined
-                let needsPermission = locationManager.authorizationStatus == .denied || 
-                                    locationManager.authorizationStatus == .restricted || 
-                                    locationManager.authorizationStatus == .notDetermined
-                
-                if needsPermission {
-                    AnimatedButton(action: {
-                        locationManager.requestLocationPermission()
-                    }) {
-                        HStack {
-                            Image(systemName: "location.fill.viewfinder")
-                                .font(.headline)
-                            
-                            Text("Request Location Permission")
-                                .font(DesignSystem.Typography.headline)
-                                .fontWeight(.medium)
-                        }
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(DesignSystem.Spacing.md)
-                        .background(DesignSystem.Colors.primary)
-                        .cornerRadius(DesignSystem.CornerRadius.md)
-                    }
-                } else {
-                    // Show helpful message when permission is already granted
+                VStack(spacing: DesignSystem.Spacing.md) {
+                    // Location Permission Row
                     HStack {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                            .font(.title2)
-                        
-                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
-                            Text("Permission Granted")
-                                .font(DesignSystem.Typography.headline)
-                                .foregroundColor(.green)
-                            
-                            Text("Location services are enabled for trip tracking")
-                                .font(DesignSystem.Typography.caption)
-                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                        HStack(spacing: DesignSystem.Spacing.sm) {
+                            Image(systemName: "location.fill")
+                                .foregroundColor(.blue)
+                                .frame(width: 20)
+                            Text("Location")
+                                .font(DesignSystem.Typography.body)
+                                .foregroundColor(DesignSystem.Colors.text)
                         }
                         
                         Spacer()
+                        
+                        if locationManager.authorizationStatus == .authorizedAlways || locationManager.authorizationStatus == .authorizedWhenInUse {
+                            Text(authorizationStatusText)
+                                .font(DesignSystem.Typography.caption)
+                                .fontWeight(.medium)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, DesignSystem.Spacing.xs)
+                                .padding(.vertical, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(.green)
+                                )
+                        } else {
+                            Button("Request") {
+                                locationManager.requestLocationPermission()
+                            }
+                            .font(DesignSystem.Typography.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, DesignSystem.Spacing.sm)
+                            .padding(.vertical, 4)
+                            .background(DesignSystem.Colors.primary)
+                            .cornerRadius(4)
+                        }
                     }
-                    .padding(DesignSystem.Spacing.md)
-                    .background(Color.green.opacity(0.1))
-                    .cornerRadius(DesignSystem.CornerRadius.md)
+                    
+                    // Microphone Permission Row
+                    HStack {
+                        HStack(spacing: DesignSystem.Spacing.sm) {
+                            Image(systemName: "mic.fill")
+                                .foregroundColor(.red)
+                                .frame(width: 20)
+                            Text("Microphone")
+                                .font(DesignSystem.Typography.body)
+                                .foregroundColor(DesignSystem.Colors.text)
+                        }
+                        
+                        Spacer()
+                        
+                        if locationManager.microphonePermissionStatus == "Granted" {
+                            Text("Granted")
+                                .font(DesignSystem.Typography.caption)
+                                .fontWeight(.medium)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, DesignSystem.Spacing.xs)
+                                .padding(.vertical, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(.green)
+                                )
+                        } else {
+                            Button("Request") {
+                                locationManager.requestMicrophonePermission()
+                            }
+                            .font(DesignSystem.Typography.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, DesignSystem.Spacing.sm)
+                            .padding(.vertical, 4)
+                            .background(DesignSystem.Colors.primary)
+                            .cornerRadius(4)
+                        }
+                    }
+                    
+                    // Motion Sensors Permission Row
+                    HStack {
+                        HStack(spacing: DesignSystem.Spacing.sm) {
+                            Image(systemName: "gyroscope")
+                                .foregroundColor(.orange)
+                                .frame(width: 20)
+                            Text("Motion Sensors")
+                                .font(DesignSystem.Typography.body)
+                                .foregroundColor(DesignSystem.Colors.text)
+                        }
+                        
+                        Spacer()
+                        
+                        if locationManager.motionSensorPermissionStatus == "Available" {
+                            Text("Available")
+                                .font(DesignSystem.Typography.caption)
+                                .fontWeight(.medium)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, DesignSystem.Spacing.xs)
+                                .padding(.vertical, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(.green)
+                                )
+                        } else {
+                            Text("Unavailable")
+                                .font(DesignSystem.Typography.caption)
+                                .fontWeight(.medium)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, DesignSystem.Spacing.xs)
+                                .padding(.vertical, 4)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(.red)
+                                )
+                        }
+                    }
                 }
             }
         }
