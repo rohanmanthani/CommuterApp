@@ -385,7 +385,7 @@ class SettingsManager: ObservableObject {
     @Published var hardBrakingSensitivity: SensitivityLevel = .medium
     @Published var accelerationSensitivity: SensitivityLevel = .medium
     @Published var sharpTurnSensitivity: SensitivityLevel = .low
-    @Published var roughRoadSensitivity: SensitivityLevel = .medium
+    @Published var roughRoadSensitivity: SensitivityLevel = .high
     @Published var hornSensitivity: SensitivityLevel = .medium
     @Published var sirenSensitivity: SensitivityLevel = .medium
     
@@ -449,7 +449,13 @@ class SettingsManager: ObservableObject {
            let level = SensitivityLevel(rawValue: rawValue) {
             setting = level
         } else {
-            setting = .medium
+            // Set improved defaults based on sensitivity key
+            switch key {
+            case roughRoadSensitivityKey:
+                setting = .high  // Improved baseline for rough road detection
+            default:
+                setting = .medium
+            }
         }
     }
     
@@ -678,8 +684,8 @@ struct DrivingMetrics: Codable {
             let speedViolationPenalty = min(Double(speedViolations) * 0.6, 6.0) // Reduced speeding impact
             let accelerationPenalty = min(Double(accelerationEvents) * 0.2, 2.0) // Smooth acceleration is fine - minimal penalty
             let distractionPenalty = min(Double(phoneDistractions) * 1.8, 10.0) // Distracted driving affects safety/comfort
-            let hornPenalty = min(Double(hornEvents) * 1.0, 8.0) // Horn noise is annoying - increased weight
-            let slowTrafficPenalty = min(slowTrafficTime / 180.0 * 2.5, 15.0) // Traffic is very frustrating - increased weight
+            let hornPenalty = min(Double(hornEvents) * 0.5, 4.0) // Horn noise is annoying but reduced impact
+            let slowTrafficPenalty = min(slowTrafficTime / 120.0 * 3.5, 20.0) // Traffic is very frustrating - increased penalty
             
             return Int(max(score - brakingPenalty - hardBrakingPenalty - roughRoadPenalty - sharpTurnPenalty - speedViolationPenalty - accelerationPenalty - distractionPenalty - hornPenalty - slowTrafficPenalty, 0))
         }
@@ -704,8 +710,8 @@ struct DrivingMetrics: Codable {
         // Apply penalties for highly uncomfortable events but allow recovery
         let majorDiscomfortPenalties = min(Double(hardBrakingEventCount) * 1.5, 8.0) + // Hard braking very jarring
                                       min(Double(roughRoadEvents) * 0.5, 4.0) + // Reduced rough road impact
-                                      min(Double(hornEvents + sirenEvents) * 1.2, 8.0) + // Noise pollution
-                                      min(slowTrafficTime / 120.0 * 2.0, 12.0) // Traffic frustration
+                                      min(Double(hornEvents + sirenEvents) * 0.6, 4.0) + // Noise pollution - reduced impact
+                                      min(slowTrafficTime / 90.0 * 3.0, 16.0) // Traffic frustration - increased penalty
         
         score -= majorDiscomfortPenalties
         
@@ -1287,6 +1293,7 @@ class SensorManager: ObservableObject {
     private let maxHistorySize = 50 // Reduced for better performance
     private var lastAccelerationEventTime: Date?
     private var lastDistractionEventTime: Date?
+    private var lastTouchEventTime: Date?
     
     // Orientation detection and coordinate transformation
     @Published var currentOrientation: DeviceOrientation = .unknown
@@ -1469,14 +1476,14 @@ class SensorManager: ObservableObject {
         let peakThreshold: Double
         switch sensitivity {
         case .low:
-            varianceThreshold = 0.15
-            peakThreshold = 0.8
-        case .medium:
             varianceThreshold = 0.1
-            peakThreshold = 0.5
+            peakThreshold = 0.6
+        case .medium:
+            varianceThreshold = 0.06
+            peakThreshold = 0.35
         case .high:
-            varianceThreshold = 0.05
-            peakThreshold = 0.3
+            varianceThreshold = 0.03
+            peakThreshold = 0.2
         }
         
         return variance > varianceThreshold || peakToPeak > peakThreshold
@@ -1541,6 +1548,11 @@ class SensorManager: ObservableObject {
     }
     
     func detectPhoneDistraction() -> Bool {
+        // Check for touch-based distractions first (higher priority)
+        if detectTouchDistraction() {
+            return true
+        }
+        
         guard let gyroscope = currentGyroscope else { return false }
         
         // Prevent duplicate detection within 3 seconds
@@ -1552,14 +1564,42 @@ class SensorManager: ObservableObject {
         // Detect significant phone rotation/movement that indicates handling the phone
         let rotationMagnitude = sqrt(pow(gyroscope.x, 2) + pow(gyroscope.y, 2) + pow(gyroscope.z, 2))
         
-        // High rotation values indicate phone manipulation during driving
-        let isDistracted = rotationMagnitude > 2.0
+        // High rotation values indicate phone manipulation during driving - increased sensitivity
+        let isDistracted = rotationMagnitude > 1.2
         
         if isDistracted {
             lastDistractionEventTime = now
         }
         
         return isDistracted
+    }
+    
+    func registerTouchEvent() {
+        let now = Date()
+        
+        // Prevent duplicate touch detection within 2 seconds
+        if let lastTime = lastTouchEventTime, now.timeIntervalSince(lastTime) < 2.0 {
+            return
+        }
+        
+        lastTouchEventTime = now
+    }
+    
+    func detectTouchDistraction() -> Bool {
+        let now = Date()
+        
+        // Check if there was a recent touch event (within last 3 seconds)
+        if let lastTime = lastTouchEventTime, now.timeIntervalSince(lastTime) < 3.0 {
+            // Also check against global distraction cooldown to avoid spam
+            if let lastDistractionTime = lastDistractionEventTime, now.timeIntervalSince(lastDistractionTime) < 3.0 {
+                return false
+            }
+            
+            lastDistractionEventTime = now
+            return true
+        }
+        
+        return false
     }
     
     // MARK: - Orientation Detection and Coordinate Transformation
@@ -1700,6 +1740,33 @@ class SensorManager: ObservableObject {
         let mean = values.reduce(0, +) / Double(values.count)
         let squaredDifferences = values.map { pow($0 - mean, 2) }
         return squaredDifferences.reduce(0, +) / Double(values.count)
+    }
+}
+
+// MARK: - Touch Detector Modifier
+struct TouchDetector: ViewModifier {
+    let sensorManager: SensorManager
+    
+    func body(content: Content) -> some View {
+        content
+            .simultaneousGesture(
+                // Non-blocking gesture that runs alongside normal UI interactions
+                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onChanged { _ in
+                        // Register touch event when touch starts/moves
+                        sensorManager.registerTouchEvent()
+                    }
+                    .onEnded { _ in
+                        // Register touch event when touch ends
+                        sensorManager.registerTouchEvent()
+                    }
+            )
+    }
+}
+
+extension View {
+    func touchDetection(sensorManager: SensorManager) -> some View {
+        modifier(TouchDetector(sensorManager: sensorManager))
     }
 }
 
@@ -2126,22 +2193,27 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         } else {
         }
         
-        // Check if location services are enabled on background queue to avoid main thread blocking
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard CLLocationManager.locationServicesEnabled() else {
-                DispatchQueue.main.async {
-                }
-                return
-            }
-            
-            DispatchQueue.main.async {
-                self?.locationManager.startUpdatingLocation()
-            }
+        // Start location updates immediately to avoid missing trip start
+        if CLLocationManager.locationServicesEnabled() {
+            locationManager.startUpdatingLocation()
         }
     }
     
     func stopLocationUpdates() -> [LocationPoint] {
         isTracking = false
+        
+        // Capture final location point if available to ensure trip end is recorded
+        if let currentLocation = locationManager.location {
+            let finalPoint = LocationPoint(
+                latitude: currentLocation.coordinate.latitude,
+                longitude: currentLocation.coordinate.longitude,
+                timestamp: Date(),
+                speed: max(0, currentLocation.speed * 3.6),
+                accuracy: currentLocation.horizontalAccuracy
+            )
+            pathPoints.append(finalPoint)
+        }
+        
         locationManager.stopUpdatingLocation()
         lastLocation = nil
         let recordedPath = pathPoints
@@ -2216,10 +2288,28 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
                 )
                 self.pathPoints.append(newPoint)
                 
-                // Limit path points to prevent memory issues (keep last 800 points for production)
-                if self.pathPoints.count > 800 {
-                    // Remove multiple points at once for better performance
-                    self.pathPoints.removeFirst(min(50, self.pathPoints.count - 800))
+                // Limit path points to prevent memory issues (keep last 1000 points to preserve trip start/end)
+                if self.pathPoints.count > 1000 {
+                    // Remove only middle points, preserve first 100 and last 100 for complete trip coverage
+                    let pointsToRemove = self.pathPoints.count - 1000
+                    let startPreserveCount = 100
+                    let endPreserveCount = 100
+                    
+                    // Only remove points from the middle portion if we have enough points
+                    if self.pathPoints.count > (startPreserveCount + endPreserveCount + pointsToRemove) {
+                        let removalStart = startPreserveCount
+                        let removalEnd = removalStart + pointsToRemove
+                        self.pathPoints.removeSubrange(removalStart..<removalEnd)
+                    } else {
+                        // Fallback: remove from middle but less aggressively
+                        let midPoint = self.pathPoints.count / 2
+                        let removeCount = min(100, pointsToRemove)
+                        let removeStart = max(50, midPoint - removeCount/2)
+                        let removeEnd = min(self.pathPoints.count - 50, removeStart + removeCount)
+                        if removeEnd > removeStart {
+                            self.pathPoints.removeSubrange(removeStart..<removeEnd)
+                        }
+                    }
                 }
             }
             
@@ -3446,6 +3536,7 @@ struct ContentView: View {
                 
                 TabView(selection: $selectedTab) {
                     TrackingView()
+                        .touchDetection(sensorManager: sensorManager)
                         .tabItem {
                             Image(systemName: "location.circle")
                             Text("Track")
@@ -3453,6 +3544,7 @@ struct ContentView: View {
                         .tag(0)
                     
                     HistoryView()
+                        .touchDetection(sensorManager: sensorManager)
                         .tabItem {
                             Image(systemName: "clock")
                             Text("History")
@@ -3460,6 +3552,7 @@ struct ContentView: View {
                         .tag(1)
                     
                     AnalyticsView()
+                        .touchDetection(sensorManager: sensorManager)
                         .tabItem {
                             Image(systemName: "chart.bar")
                             Text("Analytics")
@@ -3467,13 +3560,14 @@ struct ContentView: View {
                         .tag(2)
                     
                     SettingsView()
+                        .touchDetection(sensorManager: sensorManager)
                         .tabItem {
                             Image(systemName: "gear")
                             Text("Settings")
                         }
                         .tag(3)
-                }
-                .background(.ultraThinMaterial)
+                    }
+                    .background(.ultraThinMaterial)
             }
         .environmentObject(locationManager)
         .environmentObject(commuteTracker)
@@ -3873,23 +3967,6 @@ struct ContentView: View {
                             Text("\(String(format: "%.1f", locationManager.totalDistance/1000)) km")
                                 .font(DesignSystem.Typography.callout)
                                 .foregroundColor(DesignSystem.Colors.text)
-                                .fontWeight(.semibold)
-                        }
-                    }
-                    
-                    // Slow traffic time (second section)
-                    if commuteTracker.currentMetrics.slowTrafficTime > 0 {
-                        HStack {
-                            Image(systemName: "tortoise.fill")
-                                .font(.caption)
-                                .foregroundColor(DesignSystem.Colors.warning)
-                            Text("Slow Traffic")
-                                .font(DesignSystem.Typography.caption)
-                                .foregroundColor(DesignSystem.Colors.secondaryText)
-                            Spacer()
-                            Text(formatDuration(commuteTracker.currentMetrics.slowTrafficTime))
-                                .font(DesignSystem.Typography.callout)
-                                .foregroundColor(DesignSystem.Colors.warning)
                                 .fontWeight(.semibold)
                         }
                     }
@@ -7753,16 +7830,20 @@ struct TripMapView: UIViewRepresentable {
     }
     
     private func createSpeedBasedRouteSegments(coordinates: [CLLocationCoordinate2D], mapView: MKMapView) {
-        guard coordinates.count > 1 && commute.pathPoints.count == coordinates.count else { 
-            // Fallback: create single segment if no speed data
+        guard coordinates.count > 1 else { return }
+        
+        // If we don't have matching speed data, create a fallback line
+        guard commute.pathPoints.count == coordinates.count && commute.pathPoints.count > 1 else { 
+            // Fallback: create single segment covering the entire route
             let polyline = SpeedPolyline(coordinates: coordinates, count: coordinates.count)
             polyline.speedCategory = .normal
+            polyline.averageSpeed = 0.0 // Default speed when no data available
             mapView.addOverlay(polyline)
             return 
         }
         
-        // Define segment size for speed averaging (about 5-10 GPS points per segment)
-        let segmentSize = max(1, min(10, coordinates.count / 20)) // Adaptive segment size
+        // Define segment size for speed averaging - ensure good coverage across entire trip
+        let segmentSize = max(1, min(8, max(2, coordinates.count / 30))) // Smaller segments for better coverage
         
         var currentSegmentStart = 0
         var loopSafetyCounter = 0
@@ -8356,18 +8437,18 @@ struct DriveQualityExplanationView: View {
                                 ScoreComponent(
                                     name: "Ride Comfort",
                                     weight: "75%",
-                                    description: "Evaluates passenger comfort by detecting jarring braking, bumpy roads, and uncomfortable movements",
+                                    description: "Evaluates passenger comfort with enhanced detection of jarring braking, improved bumpy road sensitivity, and uncomfortable movements",
                                     color: .green
                                 )
                                 
                                 ScoreComponent(
                                     name: "Stress Factors",
                                     weight: "25%",
-                                    description: "Measures stress-inducing factors with reduced penalties for minor events like light braking, rough roads, and moderate speeding",
+                                    description: "Measures stress-inducing factors including phone distractions, slow traffic (heavily penalized), and environmental noise with reduced horn penalties",
                                     color: .orange
                                 )
                                 
-                                Text("Note: Smooth acceleration has minimal impact on passenger comfort and receives very light scoring weight.")
+                                Text("Note: Enhanced phone distraction detection with improved sensitivity. Smooth acceleration has minimal impact on passenger comfort. Slow traffic significantly impacts comfort scores.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                     .italic()
