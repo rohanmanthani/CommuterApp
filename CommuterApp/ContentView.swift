@@ -791,6 +791,131 @@ struct HeavyTrafficPeriod: Codable {
     }
 }
 
+// MARK: - Traffic Hotspot Analysis
+struct TrafficHotspot: Identifiable, Codable {
+    let id: UUID
+    let centerLatitude: Double
+    let centerLongitude: Double
+    let radius: Double // meters
+    let averageSlowTrafficTime: TimeInterval
+    let occurrenceCount: Int
+    let timePatterns: [TrafficTimePattern]
+    let averageSpeed: Double
+    
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: centerLatitude, longitude: centerLongitude)
+    }
+    
+    var severityLevel: TrafficSeverity {
+        switch averageSlowTrafficTime {
+        case 0..<30: return .light
+        case 30..<120: return .moderate
+        case 120..<300: return .heavy
+        default: return .severe
+        }
+    }
+}
+
+struct TrafficTimePattern: Codable {
+    let dayOfWeek: Int // 1 = Sunday, 2 = Monday, etc.
+    let hourOfDay: Int // 0-23
+    let averageSlowTrafficTime: TimeInterval
+    let occurrenceCount: Int
+    
+    var dayName: String {
+        let formatter = DateFormatter()
+        return formatter.weekdaySymbols[dayOfWeek - 1]
+    }
+    
+    var timeRange: String {
+        return "\(hourOfDay):00-\(hourOfDay + 1):00"
+    }
+}
+
+enum TrafficSeverity {
+    case light, moderate, heavy, severe
+    
+    var color: UIColor {
+        switch self {
+        case .light: return .systemGreen
+        case .moderate: return .systemYellow
+        case .heavy: return .systemOrange
+        case .severe: return .systemRed
+        }
+    }
+    
+    var description: String {
+        switch self {
+        case .light: return "Light Traffic"
+        case .moderate: return "Moderate Traffic"
+        case .heavy: return "Heavy Traffic"
+        case .severe: return "Severe Traffic"
+        }
+    }
+}
+
+struct TrafficAnalysisFilter: Equatable {
+    var selectedDayOfWeek: Int? // nil = all days, 1-7 = specific day
+    var selectedHourRange: ClosedRange<Int> // 0-23
+    var minimumOccurrences: Int // minimum times a location must have traffic to be considered
+    
+    static let defaultFilter = TrafficAnalysisFilter(
+        selectedDayOfWeek: nil,
+        selectedHourRange: 0...23,
+        minimumOccurrences: 1
+    )
+}
+
+struct TravelPatternStats {
+    let totalAreaCovered: Double // square kilometers
+    let totalRoadsExplored: Int // unique road segments
+    let regularRoutes: [RegularRoute]
+    let explorationScore: Double // 0.0-1.0 how much you explore vs stick to routes
+    let timeOfDayPatterns: [TimePattern]
+    let weekdayVsWeekendDifference: TravelDifference
+    let longestTrip: TripRecord?
+    let farthestFromHome: DistanceRecord
+}
+
+struct RegularRoute {
+    let name: String
+    let tripCount: Int
+    let averageTime: TimeInterval
+    let averageDistance: Double
+    let consistency: Double // 0.0-1.0, how consistent are the times/routes
+}
+
+struct TimePattern {
+    let period: String // "Morning Rush", "Evening", "Late Night", etc.
+    let tripCount: Int
+    let averageSpeed: Double
+    let averageTrafficDelay: TimeInterval
+}
+
+struct TravelDifference {
+    let weekdayAvgTime: TimeInterval
+    let weekendAvgTime: TimeInterval
+    let weekdayDistance: Double
+    let weekendDistance: Double
+    let weekdaySpeed: Double // m/s
+    let weekendSpeed: Double // m/s
+    let preferredDay: String
+}
+
+struct TripRecord {
+    let distance: Double
+    let duration: TimeInterval
+    let date: Date
+    let routeDescription: String
+}
+
+struct DistanceRecord {
+    let distance: Double // km from home
+    let location: LocationPoint
+    let date: Date
+    let context: String // what was happening there
+}
+
 struct DrivingEvent: Codable, Identifiable {
     let id: UUID
     let type: EventType
@@ -1765,8 +1890,12 @@ struct TouchDetector: ViewModifier {
 }
 
 extension View {
-    func touchDetection(sensorManager: SensorManager) -> some View {
-        modifier(TouchDetector(sensorManager: sensorManager))
+    func touchDetection(sensorManager: SensorManager, isEnabled: Bool = true) -> some View {
+        if isEnabled {
+            return AnyView(modifier(TouchDetector(sensorManager: sensorManager)))
+        } else {
+            return AnyView(self)
+        }
     }
 }
 
@@ -2193,9 +2322,9 @@ class LocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
         } else {
         }
         
-        // Start location updates immediately to avoid missing trip start
-        if CLLocationManager.locationServicesEnabled() {
-            locationManager.startUpdatingLocation()
+        // Start location updates on background queue to avoid UI unresponsiveness
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.locationManager.startUpdatingLocation()
         }
     }
     
@@ -3460,6 +3589,663 @@ class CommuteTracker: ObservableObject {
             print("❌ Commute not found with ID: \(commuteId)")
         }
     }
+    
+    // MARK: - Traffic Hotspot Analysis
+    func analyzeTrafficHotspots(filter: TrafficAnalysisFilter = .defaultFilter) -> [TrafficHotspot] {
+        // Early exit for empty data
+        guard !commutes.isEmpty else { return [] }
+        
+        let calendar = Calendar.current
+        let clusterRadius: Double = 250 // meters - smaller clusters for more detailed hotspots
+        
+        // Pre-filter commutes efficiently
+        let relevantCommutes = commutes.filter { commute in
+            // Quick traffic check first (fastest)
+            guard commute.drivingMetrics.slowTrafficTime > 0 || !commute.heavyTrafficPeriods.isEmpty else { 
+                return false 
+            }
+            
+            // Hour range check (avoid creating Calendar repeatedly)
+            let hour = calendar.component(.hour, from: commute.startTime)
+            guard filter.selectedHourRange.contains(hour) else { return false }
+            
+            // Day of week check (most expensive, do last)
+            if let selectedDay = filter.selectedDayOfWeek {
+                let dayOfWeek = calendar.component(.weekday, from: commute.startTime)
+                return dayOfWeek == selectedDay
+            }
+            
+            return true
+        }
+        
+        // Extract incidents efficiently with pre-allocated capacity
+        var allIncidents: [TrafficIncident] = []
+        allIncidents.reserveCapacity(relevantCommutes.count * 2) // Estimate capacity
+        
+        for commute in relevantCommutes {
+            // Process heavy traffic periods
+            for period in commute.heavyTrafficPeriods {
+                guard let startLocation = getLocationAtIndex(period.startIndex, from: commute.pathPoints),
+                      let endLocation = getLocationAtIndex(period.endIndex, from: commute.pathPoints) else { continue }
+                
+                let incident = TrafficIncident(
+                    latitude: (startLocation.latitude + endLocation.latitude) / 2,
+                    longitude: (startLocation.longitude + endLocation.longitude) / 2,
+                    slowTrafficTime: period.duration,
+                    averageSpeed: period.averageSpeed,
+                    timestamp: period.startTime
+                )
+                allIncidents.append(incident)
+            }
+            
+            // Fallback for commutes without specific heavy traffic periods - more sensitive threshold
+            if commute.heavyTrafficPeriods.isEmpty && commute.drivingMetrics.slowTrafficTime > 10,
+               let startLocation = commute.startLocation {
+                let incident = TrafficIncident(
+                    latitude: startLocation.latitude,
+                    longitude: startLocation.longitude,
+                    slowTrafficTime: commute.drivingMetrics.slowTrafficTime,
+                    averageSpeed: commute.drivingMetrics.averageSpeed,
+                    timestamp: commute.startTime
+                )
+                allIncidents.append(incident)
+            }
+        }
+        
+        // Optimized clustering using spatial grid for O(n) performance
+        let clusters = clusterIncidentsWithGrid(allIncidents, radius: clusterRadius)
+        
+        // Convert clusters to hotspots efficiently
+        return clusters.compactMap { cluster in
+            guard cluster.count >= filter.minimumOccurrences else { return nil }
+            
+            // Calculate cluster statistics in single pass
+            var totalLat = 0.0
+            var totalLng = 0.0
+            var totalSlowTime = 0.0
+            var totalSpeed = 0.0
+            
+            for incident in cluster {
+                totalLat += incident.latitude
+                totalLng += incident.longitude
+                totalSlowTime += incident.slowTrafficTime
+                totalSpeed += incident.averageSpeed
+            }
+            
+            let count = Double(cluster.count)
+            let timePatterns = calculateTimePatterns(for: cluster)
+            
+            return TrafficHotspot(
+                id: UUID(),
+                centerLatitude: totalLat / count,
+                centerLongitude: totalLng / count,
+                radius: clusterRadius / 2,
+                averageSlowTrafficTime: totalSlowTime / count,
+                occurrenceCount: cluster.count,
+                timePatterns: timePatterns,
+                averageSpeed: totalSpeed / count
+            )
+        }.sorted { $0.averageSlowTrafficTime > $1.averageSlowTrafficTime }
+    }
+    
+    // MARK: - Optimized Spatial Clustering
+    private func clusterIncidentsWithGrid(_ incidents: [TrafficIncident], radius: Double) -> [[TrafficIncident]] {
+        guard !incidents.isEmpty else { return [] }
+        
+        // Create spatial grid for O(1) lookup
+        let gridSize = radius // Grid cell size equals cluster radius
+        var grid: [String: [TrafficIncident]] = [:]
+        
+        // Assign incidents to grid cells
+        for incident in incidents {
+            let gridX = Int(incident.latitude / gridSize)
+            let gridY = Int(incident.longitude / gridSize)
+            let key = "\(gridX),\(gridY)"
+            
+            grid[key, default: []].append(incident)
+        }
+        
+        var clusters: [[TrafficIncident]] = []
+        var processed = Set<String>()
+        
+        for (key, cellIncidents) in grid {
+            guard !processed.contains(key) else { continue }
+            
+            // Start new cluster with current cell
+            var cluster = cellIncidents
+            var toProcess = [key]
+            processed.insert(key)
+            
+            // Check adjacent cells for connected incidents
+            while !toProcess.isEmpty {
+                let currentKey = toProcess.removeFirst()
+                let coords = currentKey.split(separator: ",")
+                guard coords.count == 2,
+                      let x = Int(coords[0]),
+                      let y = Int(coords[1]) else { continue }
+                
+                // Check 8 adjacent cells
+                for dx in -1...1 {
+                    for dy in -1...1 {
+                        if dx == 0 && dy == 0 { continue }
+                        
+                        let adjacentKey = "\(x + dx),\(y + dy)"
+                        guard !processed.contains(adjacentKey),
+                              let adjacentIncidents = grid[adjacentKey] else { continue }
+                        
+                        // Check if any incident in adjacent cell is within cluster radius
+                        let hasNearbyIncident = cluster.contains { clusterIncident in
+                            adjacentIncidents.contains { adjacentIncident in
+                                calculateDistance(
+                                    lat1: clusterIncident.latitude, lng1: clusterIncident.longitude,
+                                    lat2: adjacentIncident.latitude, lng2: adjacentIncident.longitude
+                                ) <= radius
+                            }
+                        }
+                        
+                        if hasNearbyIncident {
+                            cluster.append(contentsOf: adjacentIncidents)
+                            toProcess.append(adjacentKey)
+                            processed.insert(adjacentKey)
+                        }
+                    }
+                }
+            }
+            
+            clusters.append(cluster)
+        }
+        
+        return clusters
+    }
+    
+    private func calculateTimePatterns(for incidents: [TrafficIncident]) -> [TrafficTimePattern] {
+        let calendar = Calendar.current
+        var patterns: [String: (totalTime: TimeInterval, count: Int)] = [:]
+        
+        for incident in incidents {
+            let dayOfWeek = calendar.component(.weekday, from: incident.timestamp)
+            let hourOfDay = calendar.component(.hour, from: incident.timestamp)
+            let key = "\(dayOfWeek)-\(hourOfDay)"
+            
+            if var existing = patterns[key] {
+                existing.totalTime += incident.slowTrafficTime
+                existing.count += 1
+                patterns[key] = existing
+            } else {
+                patterns[key] = (totalTime: incident.slowTrafficTime, count: 1)
+            }
+        }
+        
+        return patterns.compactMap { key, value in
+            let components = key.split(separator: "-")
+            guard components.count == 2,
+                  let dayOfWeek = Int(components[0]),
+                  let hourOfDay = Int(components[1]) else { return nil }
+            
+            return TrafficTimePattern(
+                dayOfWeek: dayOfWeek,
+                hourOfDay: hourOfDay,
+                averageSlowTrafficTime: value.totalTime / Double(value.count),
+                occurrenceCount: value.count
+            )
+        }.sorted { $0.averageSlowTrafficTime > $1.averageSlowTrafficTime }
+    }
+    
+    // MARK: - Travel Pattern Analysis
+    func analyzeTravelPatterns() -> TravelPatternStats {
+        guard !commutes.isEmpty else {
+            return TravelPatternStats(
+                totalAreaCovered: 0,
+                totalRoadsExplored: 0,
+                regularRoutes: [],
+                explorationScore: 0,
+                timeOfDayPatterns: [],
+                weekdayVsWeekendDifference: TravelDifference(
+                    weekdayAvgTime: 0, weekendAvgTime: 0,
+                    weekdayDistance: 0, weekendDistance: 0,
+                    weekdaySpeed: 0, weekendSpeed: 0,
+                    preferredDay: "Unknown"
+                ),
+                longestTrip: nil,
+                farthestFromHome: DistanceRecord(distance: 0, location: LocationPoint(latitude: 0, longitude: 0, timestamp: Date(), speed: 0, accuracy: 0), date: Date(), context: "No trips")
+            )
+        }
+        
+        // Calculate meaningful area coverage
+        let boundingBox = calculateBoundingBox()
+        let totalAreaCovered = calculateBoundingBoxArea(boundingBox)
+        
+        // Count unique road segments (more meaningful than "routes")
+        let uniqueRoadSegments = extractUniqueRouteSegments()
+        
+        // Find your regular commute patterns
+        let regularRoutes = identifyRegularRoutes()
+        
+        // Calculate exploration vs routine ratio
+        let explorationScore = calculateExplorationScore()
+        
+        // Analyze time-of-day patterns
+        let timePatterns = analyzeTimeOfDayPatterns()
+        
+        // Compare weekday vs weekend travel
+        let weekdayVsWeekend = compareWeekdayVsWeekendTravel()
+        
+        // Find interesting trip records
+        let longestTrip = findLongestTrip()
+        let farthestFromHome = findFarthestFromHome()
+        
+        return TravelPatternStats(
+            totalAreaCovered: totalAreaCovered,
+            totalRoadsExplored: uniqueRoadSegments.count,
+            regularRoutes: regularRoutes,
+            explorationScore: explorationScore,
+            timeOfDayPatterns: timePatterns,
+            weekdayVsWeekendDifference: weekdayVsWeekend,
+            longestTrip: longestTrip,
+            farthestFromHome: farthestFromHome
+        )
+    }
+    
+    private func identifyRegularRoutes() -> [RegularRoute] {
+        var routeGroups: [String: [CommuteRecord]] = [:]
+        
+        // Group similar commutes
+        for commute in commutes {
+            let signature = generateRouteSignature(commute)
+            routeGroups[signature, default: []].append(commute)
+        }
+        
+        // Convert to regular routes with meaningful names
+        return Array(routeGroups.enumerated()).compactMap { index, item -> RegularRoute? in
+            let (_, commutes) = item
+            guard commutes.count >= 3 else { return nil } // Must be truly regular
+            
+            let avgTime = commutes.map { $0.duration }.reduce(0, +) / Double(commutes.count)
+            let avgDistance = commutes.map { $0.totalDistance }.reduce(0, +) / Double(commutes.count)
+            let consistency = calculateRouteConsistency(commutes)
+            let routeName = generateRouteName(commutes.first!, index: index)
+            
+            return RegularRoute(
+                name: routeName,
+                tripCount: commutes.count,
+                averageTime: avgTime,
+                averageDistance: avgDistance,
+                consistency: consistency
+            )
+        }.sorted { $0.tripCount > $1.tripCount }
+    }
+    
+    private func generateRouteSignature(_ commute: CommuteRecord) -> String {
+        // Create a more meaningful signature based on general direction and time
+        guard let start = commute.startLocation, let end = commute.endLocation else {
+            return "unknown"
+        }
+        
+        let hour = Calendar.current.component(.hour, from: commute.startTime)
+        let timeCategory = getTimeCategory(hour)
+        let direction = getGeneralDirection(from: start, to: end)
+        
+        return "\(direction)-\(timeCategory)"
+    }
+    
+    private func getTimeCategory(_ hour: Int) -> String {
+        switch hour {
+        case 6..<9: return "morning"
+        case 9..<12: return "midmorning"
+        case 12..<14: return "lunch"
+        case 14..<17: return "afternoon"
+        case 17..<20: return "evening"
+        case 20..<23: return "night"
+        default: return "latenight"
+        }
+    }
+    
+    private func getGeneralDirection(from start: LocationPoint, to end: LocationPoint) -> String {
+        let deltaLat = end.latitude - start.latitude
+        let deltaLng = end.longitude - start.longitude
+        
+        if abs(deltaLat) > abs(deltaLng) {
+            return deltaLat > 0 ? "north" : "south"
+        } else {
+            return deltaLng > 0 ? "east" : "west"
+        }
+    }
+    
+    private func generateRouteName(_ commute: CommuteRecord, index: Int) -> String {
+        let hour = Calendar.current.component(.hour, from: commute.startTime)
+        let timeDesc = getTimeDescription(hour)
+        let directionDesc = getDirectionDescription(commute)
+        
+        return "\(timeDesc) \(directionDesc)"
+    }
+    
+    private func getTimeDescription(_ hour: Int) -> String {
+        switch hour {
+        case 6..<9: return "Morning Commute"
+        case 17..<20: return "Evening Commute"
+        case 12..<14: return "Lunch Trip"
+        case 20..<23: return "Night Drive"
+        default: return "Late Night Trip"
+        }
+    }
+    
+    private func getDirectionDescription(_ commute: CommuteRecord) -> String {
+        guard let start = commute.startLocation, let end = commute.endLocation else {
+            return "Route"
+        }
+        
+        let distance = calculateDistance(lat1: start.latitude, lng1: start.longitude,
+                                       lat2: end.latitude, lng2: end.longitude) / 1000
+        
+        if distance < 2 {
+            return "Local"
+        } else if distance < 10 {
+            return "City"
+        } else if distance < 50 {
+            return "Regional"
+        } else {
+            return "Long Distance"
+        }
+    }
+    
+    private func calculateRouteConsistency(_ commutes: [CommuteRecord]) -> Double {
+        let times = commutes.map { $0.duration }
+        let avgTime = times.reduce(0, +) / Double(times.count)
+        
+        let variance = times.map { pow($0 - avgTime, 2) }.reduce(0, +) / Double(times.count)
+        let standardDeviation = sqrt(variance)
+        
+        // Consistency score: lower deviation = higher consistency
+        let coefficientOfVariation = avgTime > 0 ? standardDeviation / avgTime : 1
+        return max(0, 1 - coefficientOfVariation)
+    }
+    
+    private func calculateExplorationScore() -> Double {
+        let uniqueSegments = extractUniqueRouteSegments()
+        let totalSegments = commutes.flatMap { $0.pathPoints }.count
+        
+        guard totalSegments > 0 else { return 0 }
+        
+        // Higher score means more exploration (more unique segments per trip)
+        return min(1.0, Double(uniqueSegments.count) / Double(totalSegments) * 10)
+    }
+    
+    private func analyzeTimeOfDayPatterns() -> [TimePattern] {
+        var patterns: [String: [CommuteRecord]] = [:]
+        
+        for commute in commutes {
+            let hour = Calendar.current.component(.hour, from: commute.startTime)
+            let period = getTimePeriod(hour)
+            patterns[period, default: []].append(commute)
+        }
+        
+        return patterns.map { period, commutes in
+            let avgSpeed = commutes.map { commute in
+                commute.duration > 0 ? (commute.totalDistance / 1000) / (commute.duration / 3600) : 0
+            }.reduce(0, +) / Double(commutes.count)
+            
+            let avgTrafficDelay = commutes.map { $0.drivingMetrics.slowTrafficTime }.reduce(0, +) / Double(commutes.count)
+            
+            return TimePattern(
+                period: period,
+                tripCount: commutes.count,
+                averageSpeed: avgSpeed,
+                averageTrafficDelay: avgTrafficDelay
+            )
+        }.sorted { $0.tripCount > $1.tripCount }
+    }
+    
+    private func getTimePeriod(_ hour: Int) -> String {
+        switch hour {
+        case 5..<9: return "Morning Rush"
+        case 9..<12: return "Mid-Morning"
+        case 12..<14: return "Lunch Hour"
+        case 14..<17: return "Afternoon"
+        case 17..<20: return "Evening Rush"
+        case 20..<23: return "Evening"
+        default: return "Night/Early Morning"
+        }
+    }
+    
+    private func compareWeekdayVsWeekendTravel() -> TravelDifference {
+        let calendar = Calendar.current
+        var weekdayCommutes: [CommuteRecord] = []
+        var weekendCommutes: [CommuteRecord] = []
+        
+        for commute in commutes {
+            let weekday = calendar.component(.weekday, from: commute.startTime)
+            if weekday == 1 || weekday == 7 { // Sunday = 1, Saturday = 7
+                weekendCommutes.append(commute)
+            } else {
+                weekdayCommutes.append(commute)
+            }
+        }
+        
+        let weekdayAvgTime = weekdayCommutes.isEmpty ? 0 : weekdayCommutes.map { $0.duration }.reduce(0, +) / Double(weekdayCommutes.count)
+        let weekendAvgTime = weekendCommutes.isEmpty ? 0 : weekendCommutes.map { $0.duration }.reduce(0, +) / Double(weekendCommutes.count)
+        let weekdayDistance = weekdayCommutes.isEmpty ? 0 : weekdayCommutes.map { $0.totalDistance }.reduce(0, +) / Double(weekdayCommutes.count)
+        let weekendDistance = weekendCommutes.isEmpty ? 0 : weekendCommutes.map { $0.totalDistance }.reduce(0, +) / Double(weekendCommutes.count)
+        
+        // Calculate average speeds (distance/time)
+        let weekdaySpeed = weekdayAvgTime > 0 ? weekdayDistance / weekdayAvgTime : 0
+        let weekendSpeed = weekendAvgTime > 0 ? weekendDistance / weekendAvgTime : 0
+        
+        let preferredDay = weekdayCommutes.count > weekendCommutes.count ? "Weekdays" : "Weekends"
+        
+        return TravelDifference(
+            weekdayAvgTime: weekdayAvgTime,
+            weekendAvgTime: weekendAvgTime,
+            weekdayDistance: weekdayDistance,
+            weekendDistance: weekendDistance,
+            weekdaySpeed: weekdaySpeed,
+            weekendSpeed: weekendSpeed,
+            preferredDay: preferredDay
+        )
+    }
+    
+    private func findLongestTrip() -> TripRecord? {
+        let longest = commutes.max { $0.totalDistance < $1.totalDistance }
+        guard let trip = longest else { return nil }
+        
+        return TripRecord(
+            distance: trip.totalDistance / 1000, // Convert to km
+            duration: trip.duration,
+            date: trip.startTime,
+            routeDescription: generateTripDescription(trip)
+        )
+    }
+    
+    private func generateTripDescription(_ commute: CommuteRecord) -> String {
+        let distance = commute.totalDistance / 1000
+        let hour = Calendar.current.component(.hour, from: commute.startTime)
+        let timeDesc = getTimeDescription(hour)
+        
+        if distance > 100 {
+            return "\(timeDesc) - Long Distance Journey"
+        } else if distance > 50 {
+            return "\(timeDesc) - Highway Trip"
+        } else if distance > 20 {
+            return "\(timeDesc) - City Drive"
+        } else {
+            return "\(timeDesc) - Local Trip"
+        }
+    }
+    
+    private func findFarthestFromHome() -> DistanceRecord {
+        guard let firstCommute = commutes.first,
+              let homeLocation = firstCommute.startLocation else {
+            return DistanceRecord(distance: 0, location: LocationPoint(latitude: 0, longitude: 0, timestamp: Date(), speed: 0, accuracy: 0), date: Date(), context: "No home location")
+        }
+        
+        var farthestPoint: LocationPoint?
+        var maxDistance: Double = 0
+        var farthestDate: Date = Date()
+        
+        for commute in commutes {
+            for point in commute.pathPoints {
+                let distance = calculateDistance(
+                    lat1: homeLocation.latitude, lng1: homeLocation.longitude,
+                    lat2: point.latitude, lng2: point.longitude
+                ) / 1000 // Convert to km
+                
+                if distance > maxDistance {
+                    maxDistance = distance
+                    farthestPoint = point
+                    farthestDate = commute.startTime
+                }
+            }
+        }
+        
+        let context = generateLocationContext(maxDistance)
+        
+        return DistanceRecord(
+            distance: maxDistance,
+            location: farthestPoint ?? homeLocation,
+            date: farthestDate,
+            context: context
+        )
+    }
+    
+    private func generateLocationContext(_ distance: Double) -> String {
+        if distance > 200 {
+            return "Long-distance adventure"
+        } else if distance > 100 {
+            return "Road trip territory"
+        } else if distance > 50 {
+            return "Regional exploration"
+        } else if distance > 20 {
+            return "Extended city bounds"
+        } else {
+            return "Local area exploration"
+        }
+    }
+    
+    private func calculateBoundingBox() -> (minLat: Double, maxLat: Double, minLng: Double, maxLng: Double) {
+        var minLat = Double.infinity
+        var maxLat = -Double.infinity
+        var minLng = Double.infinity
+        var maxLng = -Double.infinity
+        
+        for commute in commutes {
+            for point in commute.pathPoints {
+                minLat = min(minLat, point.latitude)
+                maxLat = max(maxLat, point.latitude)
+                minLng = min(minLng, point.longitude)
+                maxLng = max(maxLng, point.longitude)
+            }
+        }
+        
+        return (minLat: minLat, maxLat: maxLat, minLng: minLng, maxLng: maxLng)
+    }
+    
+    private func calculateBoundingBoxArea(_ boundingBox: (minLat: Double, maxLat: Double, minLng: Double, maxLng: Double)) -> Double {
+        // Check if we have valid bounds
+        guard boundingBox.minLat != Double.infinity && boundingBox.maxLat != -Double.infinity &&
+              boundingBox.minLng != Double.infinity && boundingBox.maxLng != -Double.infinity else {
+            return 0.0
+        }
+        
+        let latDiff = boundingBox.maxLat - boundingBox.minLat
+        let lngDiff = boundingBox.maxLng - boundingBox.minLng
+        
+        // Ensure positive differences
+        guard latDiff > 0 && lngDiff > 0 else {
+            return 0.0
+        }
+        
+        // Rough approximation of area in square kilometers
+        let latKm = latDiff * 111.0 // 1 degree latitude ≈ 111 km
+        let lngKm = lngDiff * 111.0 * cos(boundingBox.minLat * .pi / 180.0) // Adjust for longitude
+        
+        return latKm * lngKm
+    }
+    
+    private func extractUniqueRouteSegments() -> Set<String> {
+        var segments = Set<String>()
+        
+        for commute in commutes {
+            let points = commute.pathPoints
+            guard points.count > 1 else { continue } // Skip commutes with insufficient points
+            
+            for i in 0..<(points.count - 1) {
+                let segment = routeSegmentKey(points[i], points[i + 1])
+                segments.insert(segment)
+            }
+        }
+        
+        return segments
+    }
+    
+    private func routeSegmentKey(_ point1: LocationPoint, _ point2: LocationPoint) -> String {
+        let lat1 = round(point1.latitude * 1000) / 1000 // Round to ~100m precision
+        let lng1 = round(point1.longitude * 1000) / 1000
+        let lat2 = round(point2.latitude * 1000) / 1000
+        let lng2 = round(point2.longitude * 1000) / 1000
+        return "\(lat1),\(lng1)-\(lat2),\(lng2)"
+    }
+    
+    private func routeSignature(_ commute: CommuteRecord) -> String {
+        guard let start = commute.startLocation, let end = commute.endLocation else {
+            return "unknown"
+        }
+        
+        let startRounded = "\(round(start.latitude * 100) / 100),\(round(start.longitude * 100) / 100)"
+        let endRounded = "\(round(end.latitude * 100) / 100),\(round(end.longitude * 100) / 100)"
+        return "\(startRounded)-\(endRounded)"
+    }
+    
+    private func calculateRouteDiversity() -> Double {
+        let routeSignatures = commutes.compactMap { routeSignature($0) }
+        let uniqueRoutes = Set(routeSignatures).count
+        let totalTrips = routeSignatures.count
+        
+        guard totalTrips > 0 else { return 0 }
+        return Double(uniqueRoutes) / Double(totalTrips)
+    }
+    
+    
+    private func findFarthestPoint() -> LocationPoint? {
+        guard let firstCommute = commutes.first,
+              let homeLocation = firstCommute.startLocation else { return nil }
+        
+        var farthestPoint: LocationPoint?
+        var maxDistance: Double = 0
+        
+        for commute in commutes {
+            for point in commute.pathPoints {
+                let distance = calculateDistance(
+                    lat1: homeLocation.latitude, lng1: homeLocation.longitude,
+                    lat2: point.latitude, lng2: point.longitude
+                )
+                if distance > maxDistance {
+                    maxDistance = distance
+                    farthestPoint = point
+                }
+            }
+        }
+        
+        return farthestPoint
+    }
+    
+    private func getLocationAtIndex(_ index: Int, from pathPoints: [LocationPoint]) -> LocationPoint? {
+        guard index >= 0 && index < pathPoints.count else { return nil }
+        return pathPoints[index]
+    }
+    
+    func calculateDistance(lat1: Double, lng1: Double, lat2: Double, lng2: Double) -> Double {
+        let location1 = CLLocation(latitude: lat1, longitude: lng1)
+        let location2 = CLLocation(latitude: lat2, longitude: lng2)
+        return location1.distance(from: location2)
+    }
+}
+
+// Helper struct for internal traffic analysis
+private struct TrafficIncident {
+    let latitude: Double
+    let longitude: Double
+    let slowTrafficTime: TimeInterval
+    let averageSpeed: Double
+    let timestamp: Date
 }
 
 // MARK: - Main Content View
@@ -3536,7 +4322,6 @@ struct ContentView: View {
                 
                 TabView(selection: $selectedTab) {
                     TrackingView()
-                        .touchDetection(sensorManager: sensorManager)
                         .tabItem {
                             Image(systemName: "location.circle")
                             Text("Track")
@@ -3544,7 +4329,6 @@ struct ContentView: View {
                         .tag(0)
                     
                     HistoryView()
-                        .touchDetection(sensorManager: sensorManager)
                         .tabItem {
                             Image(systemName: "clock")
                             Text("History")
@@ -3552,7 +4336,6 @@ struct ContentView: View {
                         .tag(1)
                     
                     AnalyticsView()
-                        .touchDetection(sensorManager: sensorManager)
                         .tabItem {
                             Image(systemName: "chart.bar")
                             Text("Analytics")
@@ -3560,7 +4343,6 @@ struct ContentView: View {
                         .tag(2)
                     
                     SettingsView()
-                        .touchDetection(sensorManager: sensorManager)
                         .tabItem {
                             Image(systemName: "gear")
                             Text("Settings")
@@ -3569,6 +4351,7 @@ struct ContentView: View {
                     }
                     .background(.ultraThinMaterial)
             }
+            .touchDetection(sensorManager: sensorManager, isEnabled: isTracking)
         .environmentObject(locationManager)
         .environmentObject(commuteTracker)
         .environmentObject(sensorManager)
@@ -5664,14 +6447,32 @@ struct ContentView: View {
     }
     
     func TrafficAnalysisInsights(filteredCommutes: [CommuteRecord]) -> some View {
-        let bestTrafficCommute = filteredCommutes.min { $0.drivingMetrics.slowTrafficTime < $1.drivingMetrics.slowTrafficTime }
-        let worstTrafficCommute = filteredCommutes.max { $0.drivingMetrics.slowTrafficTime < $1.drivingMetrics.slowTrafficTime }
+        NavigationLink(destination: TrafficHotspotsView(commutes: filteredCommutes, locationManager: locationManager)) {
+            TrafficAnalysisPreview(filteredCommutes: filteredCommutes)
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+    
+    private func TrafficAnalysisPreview(filteredCommutes: [CommuteRecord]) -> some View {
         let averageTrafficPercentage = calculateAverageTrafficPercentage(filteredCommutes)
         
         return VStack(alignment: .leading, spacing: 16) {
-            Text("Traffic Analysis")
-                .font(.title2)
-                .fontWeight(.bold)
+            HStack {
+                Text("Traffic Insights")
+                    .font(.title2)
+                    .fontWeight(.bold)
+                
+                Spacer()
+                
+                HStack(spacing: 4) {
+                    Text("View Map")
+                        .font(.caption)
+                        .foregroundColor(.blue)
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.blue)
+                }
+            }
             
             // Traffic percentage overview
             HStack {
@@ -5703,28 +6504,6 @@ struct ContentView: View {
             
             // Traffic Trends Chart
             TrafficAnalysisChart(filteredCommutes: filteredCommutes)
-            
-            // Best vs Worst traffic comparison
-            if let bestCommute = bestTrafficCommute, let worstCommute = worstTrafficCommute, 
-               bestCommute.id != worstCommute.id {
-                VStack(spacing: 12) {
-                    TrafficComparisonRow(
-                        title: "Best Traffic Day",
-                        slowTrafficTime: bestCommute.drivingMetrics.slowTrafficTime,
-                        tripDuration: bestCommute.duration,
-                        date: bestCommute.formattedDate,
-                        color: .green
-                    )
-                    
-                    TrafficComparisonRow(
-                        title: "Worst Traffic Day",
-                        slowTrafficTime: worstCommute.drivingMetrics.slowTrafficTime,
-                        tripDuration: worstCommute.duration,
-                        date: worstCommute.formattedDate,
-                        color: .red
-                    )
-                }
-            }
         }
         .frame(maxWidth: .infinity)
         .padding(DesignSystem.Spacing.md)
@@ -9009,6 +9788,623 @@ struct TimeWindowExample: View {
         .background(isOptimal ? Color.green.opacity(0.1) : Color.clear)
         .cornerRadius(6)
     }
+}
+
+// MARK: - Traffic Hotspots Map View
+struct TrafficHotspotsView: View {
+    let commutes: [CommuteRecord]
+    let locationManager: LocationManager
+    @StateObject private var commuteTracker = CommuteTracker()
+    @State private var currentFilter = TrafficAnalysisFilter.defaultFilter
+    @State private var selectedDayOfWeek: Int = 0 // 0 = All days
+    @State private var startHour: Int = 0
+    @State private var endHour: Int = 23
+    @State private var showingDayFilter = false
+    @Environment(\.presentationMode) var presentationMode
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // Time Range Selector
+            VStack(spacing: 16) {
+                HStack(spacing: 20) {
+                    // From Time
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("From")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.secondary)
+                        
+                        Menu {
+                            ForEach(0..<24) { hour in
+                                Button("\(hour):00") {
+                                    startHour = hour
+                                    if endHour <= startHour {
+                                        endHour = min(startHour + 1, 23)
+                                    }
+                                    updateFilter()
+                                }
+                            }
+                        } label: {
+                            HStack {
+                                Text("\(startHour):00")
+                                    .font(.title2)
+                                    .fontWeight(.semibold)
+                                Image(systemName: "chevron.down")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(12)
+                        }
+                        .foregroundColor(.primary)
+                    }
+                    
+                    // To Time
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("To")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.secondary)
+                        
+                        Menu {
+                            ForEach((startHour + 1)...23, id: \.self) { hour in
+                                Button("\(hour):00") {
+                                    endHour = hour
+                                    updateFilter()
+                                }
+                            }
+                        } label: {
+                            HStack {
+                                Text("\(endHour):00")
+                                    .font(.title2)
+                                    .fontWeight(.semibold)
+                                Image(systemName: "chevron.down")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(12)
+                        }
+                        .foregroundColor(.primary)
+                    }
+                }
+            }
+            .padding()
+            .background(Color(.systemBackground))
+            
+            Divider()
+            
+            // Traffic Hotspots Map
+            TrafficHotspotsMapView(filter: currentFilter, commutes: commutes, locationManager: locationManager)
+        }
+        .navigationTitle("Traffic Hotspots")
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(false)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button {
+                    showingDayFilter = true
+                } label: {
+                    Image(systemName: "line.horizontal.3.decrease")
+                        .font(.system(size: 18, weight: .medium))
+                }
+            }
+        }
+        .sheet(isPresented: $showingDayFilter) {
+            DayFilterSheet(selectedDayOfWeek: $selectedDayOfWeek, onDismiss: {
+                updateFilter()
+            })
+        }
+        .onAppear {
+            // Set initial commutes for the tracker
+            commuteTracker.commutes = commutes
+            updateFilter()
+        }
+    }
+    
+    
+    private func dayName(for day: Int) -> String {
+        if day == 0 { return "All Days" }
+        let formatter = DateFormatter()
+        return formatter.weekdaySymbols[day - 1]
+    }
+    
+    private func updateFilter() {
+        currentFilter = TrafficAnalysisFilter(
+            selectedDayOfWeek: selectedDayOfWeek == 0 ? nil : selectedDayOfWeek,
+            selectedHourRange: startHour...endHour,
+            minimumOccurrences: 1
+        )
+    }
+}
+
+struct DayFilterSheet: View {
+    @Binding var selectedDayOfWeek: Int
+    let onDismiss: () -> Void
+    @Environment(\.presentationMode) var presentationMode
+    
+    var body: some View {
+        NavigationView {
+            List {
+                ForEach(0..<8) { day in
+                    Button(action: {
+                        selectedDayOfWeek = day
+                        presentationMode.wrappedValue.dismiss()
+                        onDismiss()
+                    }) {
+                        HStack {
+                            Text(dayName(for: day))
+                                .foregroundColor(.primary)
+                            Spacer()
+                            if selectedDayOfWeek == day {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.blue)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Filter by Day")
+            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarItems(trailing: Button("Done") {
+                presentationMode.wrappedValue.dismiss()
+            })
+        }
+    }
+    
+    private func dayName(for day: Int) -> String {
+        if day == 0 { return "All Days" }
+        let formatter = DateFormatter()
+        return formatter.weekdaySymbols[day - 1]
+    }
+}
+
+struct TrafficHotspotsMapView: View {
+    let filter: TrafficAnalysisFilter
+    let commutes: [CommuteRecord]
+    let locationManager: LocationManager
+    @StateObject private var commuteTracker = CommuteTracker()
+    @State private var hotspots: [TrafficHotspot] = []
+    @State private var isLoading = true
+    
+    var body: some View {
+        VStack {
+            if isLoading {
+                VStack(spacing: 16) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle())
+                        .scaleEffect(1.2)
+                    
+                    Text("Analyzing Traffic Patterns...")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if hotspots.isEmpty {
+                VStack(spacing: 16) {
+                    Image(systemName: "map")
+                        .font(.system(size: 48))
+                        .foregroundColor(.secondary)
+                    
+                    Text("No Traffic Hotspots Found")
+                        .font(.title3)
+                        .fontWeight(.medium)
+                    
+                    Text("Try adjusting your filters to see traffic patterns")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                VStack(spacing: 0) {
+                    // Real MapKit integration - larger for full page view
+                    TrafficHotspotsMapKitView(hotspots: hotspots, commutes: commutes, locationManager: locationManager)
+                        .frame(minHeight: 400, maxHeight: .infinity)
+                        .layoutPriority(1)
+                    
+                    // Hotspot List - compact for full page view
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            HStack {
+                                Text("Hotspots (\(hotspots.count))")
+                                    .font(.headline)
+                                    .fontWeight(.semibold)
+                                
+                                Spacer()
+                            }
+                            .padding(.horizontal)
+                            
+                            ForEach(hotspots) { hotspot in
+                                HotspotRow(hotspot: hotspot)
+                            }
+                        }
+                        .padding(.bottom)
+                    }
+                    .frame(maxHeight: 300) // Limit list height to give more space to map
+                }
+            }
+        }
+        .onAppear {
+            commuteTracker.commutes = commutes
+            loadTrafficHotspots()
+        }
+        .onChange(of: filter) {
+            loadTrafficHotspots()
+        }
+    }
+    
+    private func loadTrafficHotspots() {
+        isLoading = true
+        let currentFilter = filter // Capture filter value
+        let tracker = commuteTracker // Capture tracker reference
+        
+        Task {
+            // Perform the heavy computation on a background thread
+            let computedHotspots = await Task.detached(priority: .userInitiated) {
+                return tracker.analyzeTrafficHotspots(filter: currentFilter)
+            }.value
+            
+            // Update UI on main thread
+            await MainActor.run {
+                hotspots = computedHotspots
+                isLoading = false
+            }
+        }
+    }
+    
+}
+
+struct HotspotRow: View {
+    let hotspot: TrafficHotspot
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Circle()
+                    .fill(Color(hotspot.severityLevel.color))
+                    .frame(width: 12, height: 12)
+                
+                Text(hotspot.severityLevel.description)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                
+                Spacer()
+                
+                Text("\(hotspot.occurrenceCount) times")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            
+            HStack {
+                Text("Avg delay: \(formatDuration(hotspot.averageSlowTrafficTime))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                
+                Spacer()
+                
+                Text("Avg speed: \(String(format: "%.1f", hotspot.averageSpeed)) km/h")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            
+            // Time patterns
+            if !hotspot.timePatterns.isEmpty {
+                HStack {
+                    Text("Most common:")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    
+                    ForEach(hotspot.timePatterns.prefix(2), id: \.dayOfWeek) { pattern in
+                        Text("\(pattern.dayName) \(pattern.timeRange)")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(.primary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.1))
+                            .cornerRadius(4)
+                    }
+                    
+                    Spacer()
+                }
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .cornerRadius(8)
+    }
+    
+    private func formatDuration(_ duration: TimeInterval) -> String {
+        let minutes = Int(duration / 60)
+        let seconds = Int(duration.truncatingRemainder(dividingBy: 60))
+        
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        } else {
+            return "\(seconds)s"
+        }
+    }
+}
+
+// Simple range slider implementation
+struct RangeSlider: View {
+    @Binding var range: ClosedRange<Double>
+    let bounds: ClosedRange<Double>
+    
+    var body: some View {
+        HStack(spacing: 0) {
+            Text("\(Int(bounds.lowerBound))")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(width: 30)
+            
+            // This is a simplified implementation
+            // In a production app, you'd use a proper range slider component
+            VStack(spacing: 4) {
+                HStack {
+                    Text("From:")
+                        .font(.caption2)
+                    Slider(value: .constant(range.lowerBound), in: bounds)
+                        .disabled(true)
+                }
+                HStack {
+                    Text("To:")
+                        .font(.caption2)
+                    Slider(value: .constant(range.upperBound), in: bounds)
+                        .disabled(true)
+                }
+            }
+            
+            Text("\(Int(bounds.upperBound))")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(width: 30)
+        }
+    }
+}
+
+// MARK: - MapKit Integration
+import MapKit
+
+struct TrafficHotspotsMapKitView: UIViewRepresentable {
+    let hotspots: [TrafficHotspot]
+    let commutes: [CommuteRecord]
+    let locationManager: LocationManager
+    
+    func makeUIView(context: Context) -> MKMapView {
+        let mapView = MKMapView()
+        mapView.delegate = context.coordinator
+        mapView.mapType = .standard
+        mapView.showsUserLocation = false
+        mapView.isRotateEnabled = true
+        mapView.isScrollEnabled = true
+        mapView.isZoomEnabled = true
+        
+        return mapView
+    }
+    
+    func updateUIView(_ mapView: MKMapView, context: Context) {
+        // Clear existing annotations and overlays
+        mapView.removeAnnotations(mapView.annotations)
+        mapView.removeOverlays(mapView.overlays)
+        
+        // Add route paths from commutes
+        addRoutePaths(to: mapView)
+        
+        // Add hotspot circle overlays for heatmap effect
+        let overlays = hotspots.map { hotspot in
+            let circle = MKCircle(center: hotspot.coordinate, radius: hotspot.radius)
+            return circle
+        }
+        mapView.addOverlays(overlays)
+        
+        // Fit map to show all content
+        if !overlays.isEmpty || hasValidCommutePaths() {
+            let region = calculateMapRegion(hotspots: hotspots, commutes: commutes)
+            mapView.setRegion(region, animated: true)
+        }
+    }
+    
+    private func addRoutePaths(to mapView: MKMapView) {
+        for commute in commutes {
+            if commute.pathPoints.count > 1 {
+                let coordinates = commute.pathPoints.map { point in
+                    CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude)
+                }
+                
+                let polyline = RoutePolyline(coordinates: coordinates, count: coordinates.count)
+                polyline.hasSlowTraffic = commute.drivingMetrics.slowTrafficTime > 30
+                mapView.addOverlay(polyline)
+            }
+        }
+    }
+    
+    private func hasValidCommutePaths() -> Bool {
+        return commutes.contains { $0.pathPoints.count > 1 }
+    }
+    
+    private func calculateMapRegion(hotspots: [TrafficHotspot], commutes: [CommuteRecord]) -> MKCoordinateRegion {
+        var coordinates: [CLLocationCoordinate2D] = []
+        
+        // ALWAYS include commute path points first (user's actual trips are most important)
+        for commute in commutes {
+            let validPoints = commute.pathPoints.compactMap { point -> CLLocationCoordinate2D? in
+                // Filter out invalid coordinates with stricter validation
+                if point.latitude != 0 && point.longitude != 0 && 
+                   abs(point.latitude) <= 90 && abs(point.longitude) <= 180 &&
+                   !point.latitude.isNaN && !point.longitude.isNaN &&
+                   !point.latitude.isInfinite && !point.longitude.isInfinite {
+                    return CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude)
+                }
+                return nil
+            }
+            coordinates.append(contentsOf: validPoints)
+        }
+        
+        // Add hotspot locations if we have them (supplement the trip data)
+        for hotspot in hotspots {
+            let coord = hotspot.coordinate
+            // Filter out invalid coordinates with stricter validation
+            if coord.latitude != 0 && coord.longitude != 0 && 
+               abs(coord.latitude) <= 90 && abs(coord.longitude) <= 180 &&
+               !coord.latitude.isNaN && !coord.longitude.isNaN &&
+               !coord.latitude.isInfinite && !coord.longitude.isInfinite {
+                coordinates.append(coord)
+            }
+        }
+        
+        // Fallback if no valid coordinates found
+        guard !coordinates.isEmpty else {
+            print("DEBUG: No valid coordinates found from \(commutes.count) commutes and \(hotspots.count) hotspots")
+            
+            // Try to use start/end locations from commutes as backup
+            var backupCoords: [CLLocationCoordinate2D] = []
+            for commute in commutes {
+                if let start = commute.startLocation {
+                    backupCoords.append(CLLocationCoordinate2D(latitude: start.latitude, longitude: start.longitude))
+                }
+                if let end = commute.endLocation {
+                    backupCoords.append(CLLocationCoordinate2D(latitude: end.latitude, longitude: end.longitude))
+                }
+            }
+            
+            if !backupCoords.isEmpty {
+                let avgLat = backupCoords.map { $0.latitude }.reduce(0, +) / Double(backupCoords.count)
+                let avgLng = backupCoords.map { $0.longitude }.reduce(0, +) / Double(backupCoords.count)
+                let center = CLLocationCoordinate2D(latitude: avgLat, longitude: avgLng)
+                return MKCoordinateRegion(center: center, latitudinalMeters: 1000, longitudinalMeters: 1000)
+            }
+            
+            // Use user's current location if available, otherwise default to San Francisco
+            let fallbackCenter: CLLocationCoordinate2D
+            if let currentLocation = locationManager.currentLocation {
+                fallbackCenter = currentLocation.coordinate
+                print("DEBUG: Using user's current location: \(fallbackCenter)")
+            } else {
+                fallbackCenter = CLLocationCoordinate2D(latitude: 37.7749, longitude: -122.4194)
+                print("DEBUG: Using San Francisco fallback")
+            }
+            return MKCoordinateRegion(center: fallbackCenter, 
+                                    latitudinalMeters: 1000, longitudinalMeters: 1000)
+        }
+        
+        // Calculate center and bounds
+        let lats = coordinates.map { $0.latitude }
+        let lngs = coordinates.map { $0.longitude }
+        
+        let centerLat = lats.reduce(0, +) / Double(lats.count)
+        let centerLng = lngs.reduce(0, +) / Double(lngs.count)
+        let center = CLLocationCoordinate2D(latitude: centerLat, longitude: centerLng)
+        
+        print("DEBUG: Found \(coordinates.count) valid coordinates")
+        print("DEBUG: Center calculated as: \(center)")
+        print("DEBUG: Lat range: \(lats.min() ?? 0) to \(lats.max() ?? 0)")
+        print("DEBUG: Lng range: \(lngs.min() ?? 0) to \(lngs.max() ?? 0)")
+        
+        let minLat = lats.min()!
+        let maxLat = lats.max()!
+        let minLng = lngs.min()!
+        let maxLng = lngs.max()!
+        
+        // Use distance-based calculation for better zoom control
+        let latDistance = abs(maxLat - minLat) * 111000 // degrees to meters (rough)
+        let lngDistance = abs(maxLng - minLng) * 111000 * cos(centerLat * .pi / 180)
+        
+        let maxDistance = max(latDistance, lngDistance)
+        
+        // Set zoom based on the spread of data with very tight views for detailed traffic analysis
+        let zoomMeters: Double
+        if maxDistance < 200 {
+            zoomMeters = 300 // Ultra tight area - intersection level view
+        } else if maxDistance < 500 {
+            zoomMeters = 600 // Very tight area - few blocks view
+        } else if maxDistance < 1000 {
+            zoomMeters = 1200 // Small area - neighborhood level
+        } else if maxDistance < 2500 {
+            zoomMeters = 2000 // Medium area - district level  
+        } else if maxDistance < 5000 {
+            zoomMeters = 3000 // Large area - compact city view
+        } else {
+            zoomMeters = max(maxDistance * 1.05, 4000) // Very large area with minimal padding, max 4km
+        }
+        
+        // Final validation - if center is too close to (0,0), use fallback
+        if abs(center.latitude) < 0.1 && abs(center.longitude) < 0.1 {
+            print("DEBUG: Center too close to (0,0), using fallback")
+            let fallbackCenter: CLLocationCoordinate2D
+            if let currentLocation = locationManager.currentLocation {
+                fallbackCenter = currentLocation.coordinate
+            } else {
+                fallbackCenter = CLLocationCoordinate2D(latitude: 37.7749, longitude: -122.4194)
+            }
+            return MKCoordinateRegion(center: fallbackCenter, latitudinalMeters: 1000, longitudinalMeters: 1000)
+        }
+        
+        print("DEBUG: Using calculated center: \(center) with zoom: \(zoomMeters)m")
+        return MKCoordinateRegion(center: center, latitudinalMeters: zoomMeters, longitudinalMeters: zoomMeters)
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+    
+    class Coordinator: NSObject, MKMapViewDelegate {
+        var parent: TrafficHotspotsMapKitView
+        
+        init(_ parent: TrafficHotspotsMapKitView) {
+            self.parent = parent
+        }
+        
+        
+        // MARK: - Overlay Delegate
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            if let circle = overlay as? MKCircle {
+                let renderer = MKCircleRenderer(circle: circle)
+                
+                // Find the hotspot this circle represents
+                if let matchingHotspot = parent.hotspots.first(where: { hotspot in
+                    let distance = CLLocation(latitude: circle.coordinate.latitude, longitude: circle.coordinate.longitude)
+                        .distance(from: CLLocation(latitude: hotspot.centerLatitude, longitude: hotspot.centerLongitude))
+                    return distance < 10 // Within 10 meters
+                }) {
+                    // Create heatmap-style visualization based on severity
+                    let baseColor = matchingHotspot.severityLevel.color
+                    let intensity = min(1.0, Double(matchingHotspot.occurrenceCount) / 10.0) // Scale intensity
+                    
+                    renderer.fillColor = baseColor.withAlphaComponent(0.3 + (intensity * 0.4))
+                    renderer.strokeColor = baseColor.withAlphaComponent(0.7 + (intensity * 0.3))
+                } else {
+                    // Fallback colors
+                    renderer.fillColor = UIColor.red.withAlphaComponent(0.3)
+                    renderer.strokeColor = UIColor.red.withAlphaComponent(0.7)
+                }
+                
+                renderer.lineWidth = 1.5
+                return renderer
+            }
+            
+            if let polyline = overlay as? RoutePolyline {
+                let renderer = MKPolylineRenderer(polyline: polyline)
+                renderer.strokeColor = polyline.hasSlowTraffic ? UIColor.red.withAlphaComponent(0.7) : UIColor.blue.withAlphaComponent(0.5)
+                renderer.lineWidth = 3
+                renderer.lineCap = .round
+                renderer.lineJoin = .round
+                return renderer
+            }
+            
+            return MKOverlayRenderer(overlay: overlay)
+        }
+    }
+}
+
+// MARK: - Custom Map Overlays
+class RoutePolyline: MKPolyline {
+    var hasSlowTraffic: Bool = false
 }
 
 // MARK: - Advanced Sensitivity Settings View
