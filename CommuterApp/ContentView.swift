@@ -19,7 +19,7 @@ extension DispatchQueue {
 
 // MARK: - Design System
 struct DesignSystem {
-    // Colors
+    // Colors - Theme-aware system colors
     struct Colors {
         static let primary = Color.blue
         static let secondary = Color(.systemBlue)
@@ -27,11 +27,25 @@ struct DesignSystem {
         static let success = Color.green
         static let warning = Color.orange
         static let error = Color.red
-        static let background = Color(.systemGroupedBackground)
+        
+        // Adaptive system colors that respond to dark/light mode
+        static let background = Color(.systemBackground)
+        static let secondaryBackground = Color(.secondarySystemBackground)
+        static let groupedBackground = Color(.systemGroupedBackground)
         static let cardBackground = Color(.secondarySystemGroupedBackground)
-        static let text = Color.primary
-        static let secondaryText = Color.secondary
+        static let tertiaryBackground = Color(.tertiarySystemBackground)
+        
+        // Text colors that adapt to theme
+        static let text = Color(.label)
+        static let secondaryText = Color(.secondaryLabel)
+        static let tertiaryText = Color(.tertiaryLabel)
+        static let quaternaryText = Color(.quaternaryLabel)
+        
+        // Separator and border colors
+        static let separator = Color(.separator)
         static let borderColor = Color(.systemGray4)
+        static let fillColor = Color(.systemFill)
+        static let secondaryFillColor = Color(.secondarySystemFill)
         
         // DQI (Drive Quality Index) colors
         static let excellent = Color.green
@@ -80,11 +94,16 @@ struct DesignSystem {
         static let xl: CGFloat = 20
     }
     
-    // Shadows
+    // Shadows - Theme-aware shadows
     struct Shadow {
-        static let light = Color.black.opacity(0.1)
-        static let medium = Color.black.opacity(0.15)
-        static let heavy = Color.black.opacity(0.25)
+        static let light = Color(.black).opacity(0.1)
+        static let medium = Color(.black).opacity(0.15)
+        static let heavy = Color(.black).opacity(0.25)
+        
+        // Alternative shadows for dark mode
+        static func adaptive(light: Double = 0.1, dark: Double = 0.3) -> Color {
+            Color(.black).opacity(light)
+        }
     }
     
     // Glass morphism materials
@@ -546,6 +565,72 @@ class SettingsManager: ObservableObject {
         case "horn": return hornSensitivity
         case "siren": return sirenSensitivity
         default: return .medium
+        }
+    }
+}
+
+// MARK: - Theme Management
+enum AppTheme: String, CaseIterable {
+    case light = "light"
+    case dark = "dark"
+    case system = "system"
+    
+    var displayName: String {
+        switch self {
+        case .light: return "Light"
+        case .dark: return "Dark"
+        case .system: return "Match System"
+        }
+    }
+    
+    var iconName: String {
+        switch self {
+        case .light: return "sun.max"
+        case .dark: return "moon"
+        case .system: return "circle.lefthalf.filled"
+        }
+    }
+}
+
+class ThemeManager: ObservableObject {
+    @Published var currentTheme: AppTheme = .system
+    private let userDefaults = UserDefaults.standard
+    private let themeKey = "AppTheme"
+    
+    init() {
+        loadTheme()
+    }
+    
+    func setTheme(_ theme: AppTheme) {
+        currentTheme = theme
+        saveTheme()
+        applyTheme()
+    }
+    
+    private func loadTheme() {
+        if let themeString = userDefaults.string(forKey: themeKey),
+           let theme = AppTheme(rawValue: themeString) {
+            currentTheme = theme
+        }
+        applyTheme()
+    }
+    
+    private func saveTheme() {
+        userDefaults.set(currentTheme.rawValue, forKey: themeKey)
+        userDefaults.synchronize()
+    }
+    
+    private func applyTheme() {
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let window = windowScene.windows.first else { return }
+        
+        switch currentTheme {
+        case .light:
+            window.overrideUserInterfaceStyle = .light
+        case .dark:
+            window.overrideUserInterfaceStyle = .dark
+        case .system:
+            window.overrideUserInterfaceStyle = .unspecified
         }
     }
 }
@@ -2565,8 +2650,7 @@ class CommuteTracker: ObservableObject {
     @Published var currentMetrics = DrivingMetrics()
     private var currentDrivingEvents: [DrivingEvent] = []
     
-    // iCloud sync status tracking
-    @Published var isSyncInProgress: Bool = false
+    // Sync status tracking
     @Published var lastSyncTime: Date?
     @Published var syncDataSize: String = "0 KB"
     
@@ -3226,13 +3310,13 @@ class CommuteTracker: ObservableObject {
             
             let data = try encoder.encode(commutes)
             
+            // Save to UserDefaults
             userDefaults.set(data, forKey: commutesKey)
-            
             
             // Update sync data size
             syncDataSize = formatBytes(data.count)
             
-            // Perform iCloud sync
+            // Perform UserDefaults sync
             userDefaults.synchronize()
             lastSyncTime = Date()
             
@@ -3264,6 +3348,7 @@ class CommuteTracker: ObservableObject {
             }
         }
         
+        // Load from UserDefaults
         guard let data = userDefaults.data(forKey: commutesKey),
               !data.isEmpty else {
             // Initialize empty sync data size
@@ -4259,6 +4344,7 @@ struct ContentView: View {
     @StateObject private var sensorManager = SensorManager()
     @StateObject private var tripManager = TripManager()
     @StateObject private var soundAnalysisManager = SoundAnalysisManager()
+    @StateObject private var themeManager = ThemeManager()
     @State private var selectedTab = 0
     @State private var isTracking = false
     @State private var trackingDuration: TimeInterval = 0
@@ -4308,12 +4394,16 @@ struct ContentView: View {
             }
         } else {
             ZStack {
-                // Liquid glass background
+                // Adaptive background that works in light and dark mode
+                DesignSystem.Colors.background
+                    .ignoresSafeArea()
+                
+                // Subtle gradient overlay
                 LinearGradient(
                     gradient: Gradient(colors: [
-                        Color.blue.opacity(0.1),
-                        Color.purple.opacity(0.05),
-                        Color.indigo.opacity(0.08)
+                        DesignSystem.Colors.primary.opacity(0.03),
+                        DesignSystem.Colors.secondary.opacity(0.02),
+                        Color.clear
                     ]),
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -4358,6 +4448,7 @@ struct ContentView: View {
         .environmentObject(settingsManager)
         .environmentObject(tripManager)
         .environmentObject(soundAnalysisManager)
+        .environmentObject(themeManager)
         .accentColor(.blue)
         .onAppear {
             locationManager.requestLocationPermission()
@@ -7263,16 +7354,16 @@ struct ContentView: View {
                         Text("\(displayValue)")
                             .font(.title3)
                             .fontWeight(.bold)
-                            .foregroundColor(.blue)
+                            .foregroundColor(DesignSystem.Colors.text)
                         
                         Text("km/h")
                             .font(.caption2)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
                     }
                     .frame(minWidth: 50)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(Color.blue.opacity(0.1))
+                    .background(DesignSystem.Colors.secondaryFillColor)
                     .cornerRadius(6)
                     
                     Button(action: {
@@ -7329,16 +7420,16 @@ struct ContentView: View {
                         Text(displayText)
                             .font(.title3)
                             .fontWeight(.bold)
-                            .foregroundColor(.green)
+                            .foregroundColor(DesignSystem.Colors.text)
                         
                         Text("hours")
                             .font(.caption2)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(DesignSystem.Colors.secondaryText)
                     }
                     .frame(minWidth: 50)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(Color.green.opacity(0.1))
+                    .background(DesignSystem.Colors.secondaryFillColor)
                     .cornerRadius(6)
                     
                     Button(action: {
@@ -7832,6 +7923,7 @@ struct ContentView: View {
             ScrollView {
                 VStack(spacing: DesignSystem.Spacing.lg) {
                     drivingPreferencesSection()
+                    themePreferencesSection()
                     appPermissionsSection()
                     sensorPreferencesSection()
                     dataManagementSection()
@@ -7885,6 +7977,75 @@ struct ContentView: View {
         let formatter = RelativeDateTimeFormatter()
         formatter.dateTimeStyle = .named
         return formatter.localizedString(for: date, relativeTo: Date())
+    }
+    
+    // MARK: - Theme Preferences Section
+    func themePreferencesSection() -> some View {
+        CardView {
+            VStack(alignment: .leading, spacing: DesignSystem.Spacing.lg) {
+                HStack {
+                    Label {
+                        Text("Appearance")
+                            .font(DesignSystem.Typography.title3)
+                            .foregroundColor(DesignSystem.Colors.text)
+                    } icon: {
+                        Image(systemName: "paintbrush")
+                            .foregroundColor(DesignSystem.Colors.primary)
+                    }
+                    
+                    Spacer()
+                }
+                
+                VStack(spacing: DesignSystem.Spacing.md) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: DesignSystem.Spacing.xs) {
+                            Text("Theme")
+                                .font(DesignSystem.Typography.headline)
+                                .foregroundColor(DesignSystem.Colors.text)
+                            
+                            Text("Choose how the app looks")
+                                .font(DesignSystem.Typography.caption)
+                                .foregroundColor(DesignSystem.Colors.secondaryText)
+                        }
+                        
+                        Spacer()
+                        
+                        Menu {
+                            ForEach(AppTheme.allCases, id: \.self) { theme in
+                                Button(action: {
+                                    themeManager.setTheme(theme)
+                                }) {
+                                    HStack {
+                                        Image(systemName: theme.iconName)
+                                        Text(theme.displayName)
+                                        if themeManager.currentTheme == theme {
+                                            Spacer()
+                                            Image(systemName: "checkmark")
+                                        }
+                                    }
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: DesignSystem.Spacing.sm) {
+                                Image(systemName: themeManager.currentTheme.iconName)
+                                    .font(.title3)
+                                Text(themeManager.currentTheme.displayName)
+                                    .font(DesignSystem.Typography.callout)
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.caption2)
+                            }
+                            .foregroundColor(DesignSystem.Colors.primary)
+                            .padding(.horizontal, DesignSystem.Spacing.sm)
+                            .padding(.vertical, DesignSystem.Spacing.xs)
+                            .background(
+                                RoundedRectangle(cornerRadius: DesignSystem.CornerRadius.sm)
+                                    .fill(DesignSystem.Colors.primary.opacity(0.1))
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
     
     var iCloudSyncSection: some View {
@@ -10185,6 +10346,17 @@ struct TrafficHotspotsMapKitView: UIViewRepresentable {
         mapView.isScrollEnabled = true
         mapView.isZoomEnabled = true
         
+        // Set initial region immediately to prevent showing entire world
+        if !commutes.isEmpty || !hotspots.isEmpty {
+            print("🗺️ INITIAL MAP DEBUG: Commutes count: \(commutes.count), Hotspots count: \(hotspots.count)")
+            let initialRegion = calculateMapRegion(hotspots: hotspots, commutes: commutes)
+            print("🗺️ INITIAL MAP DEBUG: Setting initial region to \(initialRegion)")
+            print("🗺️ INITIAL MAP DEBUG: Region span - lat: \(initialRegion.span.latitudeDelta), lng: \(initialRegion.span.longitudeDelta)")
+            mapView.setRegion(initialRegion, animated: false)
+        } else {
+            print("🗺️ INITIAL MAP DEBUG: ⚠️ No commutes or hotspots available for initial region")
+        }
+        
         return mapView
     }
     
@@ -10204,9 +10376,13 @@ struct TrafficHotspotsMapKitView: UIViewRepresentable {
         mapView.addOverlays(overlays)
         
         // Fit map to show all content
-        if !overlays.isEmpty || hasValidCommutePaths() {
+        // Always calculate and set the region if we have commutes or hotspots
+        if !commutes.isEmpty || !hotspots.isEmpty {
             let region = calculateMapRegion(hotspots: hotspots, commutes: commutes)
-            mapView.setRegion(region, animated: true)
+            print("🗺️ MAP DEBUG: Setting map region to \(region)")
+            mapView.setRegion(region, animated: false) // Don't animate for immediate positioning
+        } else {
+            print("🗺️ MAP DEBUG: ⚠️ No commutes or hotspots to display")
         }
     }
     
@@ -10277,7 +10453,7 @@ struct TrafficHotspotsMapKitView: UIViewRepresentable {
                 let avgLat = backupCoords.map { $0.latitude }.reduce(0, +) / Double(backupCoords.count)
                 let avgLng = backupCoords.map { $0.longitude }.reduce(0, +) / Double(backupCoords.count)
                 let center = CLLocationCoordinate2D(latitude: avgLat, longitude: avgLng)
-                return MKCoordinateRegion(center: center, latitudinalMeters: 1000, longitudinalMeters: 1000)
+                return MKCoordinateRegion(center: center, latitudinalMeters: 300, longitudinalMeters: 300)
             }
             
             // Use user's current location if available, otherwise default to San Francisco
@@ -10290,7 +10466,7 @@ struct TrafficHotspotsMapKitView: UIViewRepresentable {
                 print("DEBUG: Using San Francisco fallback")
             }
             return MKCoordinateRegion(center: fallbackCenter, 
-                                    latitudinalMeters: 1000, longitudinalMeters: 1000)
+                                    latitudinalMeters: 400, longitudinalMeters: 400)
         }
         
         // Calculate center and bounds
@@ -10301,10 +10477,10 @@ struct TrafficHotspotsMapKitView: UIViewRepresentable {
         let centerLng = lngs.reduce(0, +) / Double(lngs.count)
         let center = CLLocationCoordinate2D(latitude: centerLat, longitude: centerLng)
         
-        print("DEBUG: Found \(coordinates.count) valid coordinates")
-        print("DEBUG: Center calculated as: \(center)")
-        print("DEBUG: Lat range: \(lats.min() ?? 0) to \(lats.max() ?? 0)")
-        print("DEBUG: Lng range: \(lngs.min() ?? 0) to \(lngs.max() ?? 0)")
+        print("🗺️ MAP DEBUG: Found \(coordinates.count) valid coordinates from \(commutes.count) commutes")
+        print("🗺️ MAP DEBUG: Center calculated as: \(center)")
+        print("🗺️ MAP DEBUG: Lat range: \(lats.min() ?? 0) to \(lats.max() ?? 0)")
+        print("🗺️ MAP DEBUG: Lng range: \(lngs.min() ?? 0) to \(lngs.max() ?? 0)")
         
         let minLat = lats.min()!
         let maxLat = lats.max()!
@@ -10316,36 +10492,43 @@ struct TrafficHotspotsMapKitView: UIViewRepresentable {
         let lngDistance = abs(maxLng - minLng) * 111000 * cos(centerLat * .pi / 180)
         
         let maxDistance = max(latDistance, lngDistance)
+        print("🗺️ MAP DEBUG: Max distance: \(maxDistance)m")
         
-        // Set zoom based on the spread of data with very tight views for detailed traffic analysis
+        // Set zoom based on the spread of data with extremely tight views for detailed traffic analysis
         let zoomMeters: Double
         if maxDistance < 200 {
-            zoomMeters = 300 // Ultra tight area - intersection level view
+            zoomMeters = 150 // Ultra tight area - street level view
+            print("🗺️ MAP DEBUG: Using ultra-tight zoom (150m) for \(maxDistance)m spread")
         } else if maxDistance < 500 {
-            zoomMeters = 600 // Very tight area - few blocks view
+            zoomMeters = 250 // Very tight area - single intersection view
+            print("🗺️ MAP DEBUG: Using very tight zoom (250m) for \(maxDistance)m spread")
         } else if maxDistance < 1000 {
-            zoomMeters = 1200 // Small area - neighborhood level
+            zoomMeters = 400 // Small area - few intersections
+            print("🗺️ MAP DEBUG: Using tight zoom (400m) for \(maxDistance)m spread")
         } else if maxDistance < 2500 {
-            zoomMeters = 2000 // Medium area - district level  
+            zoomMeters = 800 // Medium area - neighborhood block level  
+            print("🗺️ MAP DEBUG: Using medium zoom (800m) for \(maxDistance)m spread")
         } else if maxDistance < 5000 {
-            zoomMeters = 3000 // Large area - compact city view
+            zoomMeters = 1200 // Large area - district view
+            print("🗺️ MAP DEBUG: Using large zoom (1200m) for \(maxDistance)m spread")
         } else {
-            zoomMeters = max(maxDistance * 1.05, 4000) // Very large area with minimal padding, max 4km
+            zoomMeters = max(maxDistance * 1.02, 1500) // Very large area with minimal padding, max 1.5km
+            print("🗺️ MAP DEBUG: Using max zoom (\(zoomMeters)m) for \(maxDistance)m spread")
         }
         
         // Final validation - if center is too close to (0,0), use fallback
         if abs(center.latitude) < 0.1 && abs(center.longitude) < 0.1 {
-            print("DEBUG: Center too close to (0,0), using fallback")
+            print("🗺️ MAP DEBUG: ❌ Center too close to (0,0), using fallback location")
             let fallbackCenter: CLLocationCoordinate2D
             if let currentLocation = locationManager.currentLocation {
                 fallbackCenter = currentLocation.coordinate
             } else {
                 fallbackCenter = CLLocationCoordinate2D(latitude: 37.7749, longitude: -122.4194)
             }
-            return MKCoordinateRegion(center: fallbackCenter, latitudinalMeters: 1000, longitudinalMeters: 1000)
+            return MKCoordinateRegion(center: fallbackCenter, latitudinalMeters: 300, longitudinalMeters: 300)
         }
         
-        print("DEBUG: Using calculated center: \(center) with zoom: \(zoomMeters)m")
+        print("🗺️ MAP DEBUG: ✅ FINAL REGION - Center: \(center), Zoom: \(zoomMeters)m")
         return MKCoordinateRegion(center: center, latitudinalMeters: zoomMeters, longitudinalMeters: zoomMeters)
     }
     
